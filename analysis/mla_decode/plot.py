@@ -92,7 +92,7 @@ for i, gpu in enumerate(gpus):
                 f"{val:.1f}%", ha="center", va="bottom", fontsize=8)
 
 ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-ax.set_xlabel("Context Length", fontsize=fontsize)
+ax.set_xlabel("Sequence Length", fontsize=fontsize)
 ax.set_ylabel("Avg. Latency Reduction vs ASM (%)", fontsize=fontsize)
 ax.set_title("MLA Decode: HipKittens Speed Gain over Hand-Written Assembly\n(averaged over batch sizes)", fontsize=fontsize)
 ax.set_xticks(x)
