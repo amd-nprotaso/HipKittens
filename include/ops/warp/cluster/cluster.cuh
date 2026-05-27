@@ -1,12 +1,15 @@
 /**
  * @file
- * @brief Workgroup-cluster primitives for gfx1250 (CGA).
+ * @brief Workgroup-cluster primitives for gfx1250.
  *
- * gfx1250 supports CUDA-Graph-style workgroup clusters (CGA) where up to 5
+ * The HIP compute hierarchy is:
+ * **Grid -> Cluster -> Workgroup -> Wave -> Thread**.
+ *
+ * gfx1250 supports CUDA thread block clusters (known as workgroup clusters) where up to 5
  * workgroups dispatched together can share a cluster-wide split barrier and
  * coalesce GL1 line requests via multicast.
  *
- * The runtime side (HIP CGA launch API) is still landing; in the meantime
+ * The runtime side (HIP launch API) is still landing; in the meantime
  * this header provides the **device-side** primitives that take a `M0`
  * multicast mask and route through the same async-load builtins. Outside a
  * cluster (`workgroup_mask == 0`) the multicast-aware load reduces to a
