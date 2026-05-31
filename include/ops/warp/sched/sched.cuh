@@ -2,10 +2,30 @@
  * @file
  * @brief Scheduling primitives for gfx1250.
  *
- * Wraps the gfx1250 scheduling controls -- expert SCHED_MODE, wave priority,
- * `s_sleep` -- behind a `kittens::sched::*` API. The expert RAII guard is the
- * primary entry point: constructing it sets SCHED_MODE to the requested
- * value and the destructor restores the default (mode 0, normal scheduling).
+ * Wraps four families of low-level scheduling controls behind a
+ * `kittens::sched::*` API:
+ *
+ *   1. **Expert scheduling** -- by default a wave's memory instructions
+ *      (loads and stores) are held until that wave's earlier math
+ *      instructions have finished, so the hardware never has to track a
+ *      dependency between the two for you. Expert mode lifts that automatic
+ *      hold, so memory and math from the same wave overlap freely. That
+ *      overlap is the key enabler for tight producer/consumer GEMM loops.
+ *      In exchange, the kernel author becomes responsible for inserting an
+ *      explicit wait (`wait_alu`) wherever a later instruction really does
+ *      depend on a math result. See `set_expert`, `expert_scope`,
+ *      `claim_simd`.
+ *   2. **Wave priority** -- a hint that breaks ties when several waves on
+ *      the same SIMD want to issue in the same cycle; the higher-priority
+ *      wave goes first. See `set_priority` (this wave alone) and
+ *      `boost_priority` (the rest of the workgroup on this SIMD).
+ *   3. **Sleep** -- park the wave for a short, coarse interval. Gives a
+ *      producer some headroom when a consumer would otherwise run ahead of
+ *      the data it needs. See `sleep`.
+ *   4. **Compiler fence** -- a compile-time-only barrier that stops the
+ *      compiler from reordering instructions across a point. Emits no
+ *      hardware instruction and costs nothing at runtime. See
+ *      `compiler_fence`.
  */
 
 #pragma once
@@ -17,63 +37,131 @@
 namespace kittens {
 namespace sched {
 
-/**
- * @brief gfx1250 SCHED_MODE values.
- *
- * - `normal`   : full hardware counter checks (default).
- * - `limited`  : disables `VA_VDST` and `VM_VSRC` checks. Lets VMEM<->VALU
- *                pack tighter when the programmer has manually proven
- *                independence (e.g. async loads issued ahead of WMMA).
- * - `full`     : disables most VALU/VMEM counter checks. AMD documents this
- *                as experimental / unsafe by default.
- */
-enum class mode : int {
-    normal  = 0,
-    full    = 1,
-    limited = 2,
-};
-
-// `s_setreg_b32 hwreg(MODE_REG=1, offset=4, size=2), value`
-// Encoded simm16 = 1 | (4 << 6) | ((2-1) << 11) = 2305.
-constexpr int SCHED_MODE_HWREG_SIMM16 = 1 | (4 << 6) | (1 << 11);
+namespace detail {
+// Opaque, gfx1250-specific operands for the s_setreg instructions that
+// toggle this wave's expert-scheduling controls.
+constexpr int SCHED_MODE_EXPERT_SIMM16    = 26 | (0 << 6) | (1 << 11);  // expert mode on/off
+constexpr int SCHED_MODE_CLAIM_SIMD_SIMM16 = 26 | (4 << 6) | (0 << 11);  // back-to-back WMMAs
+} // namespace detail
 
 /**
- * @brief Set the wave's SCHED_MODE to `m`.
+ * @brief Enable (`on=true`) or disable expert scheduling for this wave.
  *
- * Prefer the `expert` RAII guard below -- direct use of `set_mode` skips the
- * automatic restoration on scope exit.
+ * Enabling removes the default hold that keeps a wave's memory
+ * instructions (loads and stores) from issuing until that wave's earlier
+ * math instructions have finished. With it on, memory and math from the
+ * same wave overlap freely -- the key enabler for tight producer/consumer
+ * GEMM inner loops, where an async global-to-LDS load is launched ahead of
+ * a sequence of matrix multiplies with no stall between them.
+ *
+ * Caller responsibility once expert mode is on: any time a later
+ * instruction genuinely needs the result of a math instruction (anything
+ * the wave computes on its vector lanes -- ordinary arithmetic and matrix
+ * multiplies / WMMA alike), insert an explicit `kittens::sched::wait_alu<>()`
+ * before that consumer. With expert mode off the hardware inserts this wait
+ * for you; with it on, you do.
+ *
+ * Whoever turns it on must also turn it off. Prefer `expert_scope`, which
+ * does both at the start and end of a scope.
  */
-__device__ __forceinline__ void set_mode(mode m) {
-    __builtin_amdgcn_s_setreg(SCHED_MODE_HWREG_SIMM16, static_cast<unsigned>(m));
+__device__ __forceinline__ void set_expert(bool on) {
+    __builtin_amdgcn_s_setreg(detail::SCHED_MODE_EXPERT_SIMM16,
+                              on ? 1u : 0u);
 }
 
 /**
- * @brief RAII guard that switches SCHED_MODE for a scope.
+ * @brief RAII guard: enable expert mode for a scope; restore default on exit.
  *
  * @code
  *   {
- *     kittens::sched::expert _sched;          // limited expert in scope
- *     for (int k = 0; k < K; ++k) { ... }
- *   }                                          // mode restored to normal
+ *     kittens::sched::expert_scope _sched;     // expert mode on here
+ *     for (int k = 0; k < K; ++k) {
+ *       // memory loads and matrix multiplies overlap within this wave
+ *     }
+ *   }                                          // destructor turns it back off
  * @endcode
  *
- * The default ctor enables `mode::limited`, which is the recommended setting
- * for hand-scheduled producer/consumer kernels. Use `expert{mode::full}` when
- * you have verified there are no inter-class hazards.
+ * On scope exit the destructor calls `set_expert(false)`, restoring default
+ * scheduling -- so the [enable -> K-loop -> disable] pattern stays correct
+ * even on an early return or a thrown exception. Non-copyable and
+ * non-movable by design: a wave-state guard's lifetime should track a stack
+ * scope exactly.
  */
-struct expert {
-    __device__ __forceinline__ expert(mode m = mode::limited) { set_mode(m); }
-    __device__ __forceinline__ ~expert()                       { set_mode(mode::normal); }
+struct expert_scope {
+    __device__ __forceinline__ expert_scope()  { set_expert(true);  }
+    __device__ __forceinline__ ~expert_scope() { set_expert(false); }
 
-    expert(const expert&)            = delete;
-    expert& operator=(const expert&) = delete;
+    expert_scope(const expert_scope&)            = delete;
+    expert_scope& operator=(const expert_scope&) = delete;
 };
 
 /**
- * @brief Bump the wave priority field.
+ * @brief Claim the SIMD for this wave so it can issue matrix multiplies
+ *        back-to-back, instead of yielding to co-resident waves between them.
  *
- * Lowers to `s_setprio N`. N is in [0,3]; higher = more SIMD slots.
- * Template-parameterized because the builtin requires a constant.
+ * Normally, after a wave issues a matrix multiply (WMMA) the hardware makes
+ * it pause briefly before issuing anything else, so other waves sharing the
+ * same SIMD get a turn to run their own work in the gap. This call removes
+ * that pause for the issuing wave, letting it stream WMMAs one after another
+ * with no forced break.
+ *
+ * **Use it** when a single wave owns the SIMD (one-wave-per-SIMD kernels):
+ * there is no one else to hand the gap to, so the pause is pure overhead.
+ *
+ * **Avoid it** when two or more waves share a SIMD and you rely on them to
+ * fill each other's gaps -- removing the pause starves the others.
+ *
+ * Set this once near the top of the kernel. Unlike `expert_scope` it is not
+ * scoped and there is no guard for it: it stays in effect for the wave's
+ * lifetime.
+ */
+__device__ __forceinline__ void claim_simd() {
+    __builtin_amdgcn_s_setreg(detail::SCHED_MODE_CLAIM_SIMD_SIMM16, 1u);
+}
+
+/**
+ * @brief Wait until this wave's outstanding math results are ready.
+ *
+ * "Math" here means anything the wave computes on its vector lanes --
+ * ordinary arithmetic and matrix multiplies / WMMA. Lowers to
+ * `s_wait_alu <BITS>`, where `BITS` selects which dependency counters to
+ * wait on (e.g. outstanding scalar-register writes vs. vector-register
+ * writes); see the AMD ISA assembler reference for the named `depctr_*`
+ * constants.
+ *
+ * **Why you need it under expert mode**: with expert scheduling on, the
+ * hardware no longer auto-inserts the wait between a math instruction and a
+ * later instruction that consumes its result. Insert `wait_alu` yourself
+ * wherever such a dependency exists. (With expert mode off it is never
+ * needed.)
+ *
+ * @note Clang 23 does not expose `__builtin_amdgcn_s_wait_alu`; we emit
+ *       the instruction directly with `BITS` as an immediate operand.
+ *       Same convention as `sync::wait_load` / `wait_ds` / etc.
+ *
+ * @tparam BITS  Dependency mask (see AMD ISA assembler reference for the
+ *               named `depctr_*` constants and their encodings).
+ */
+template<int BITS>
+__device__ __forceinline__ void wait_alu() {
+    asm volatile("s_wait_alu %0" :: "i"(BITS) : "memory");
+}
+
+/**
+ * @brief Set this wave's issue priority to `PRIO`.
+ *
+ * Lowers to `s_setprio N`, with `N` in `[0, 3]`. When several waves on the
+ * same SIMD want to issue in the same cycle, the hardware lets the
+ * higher-priority wave go first. Default is `0`.
+ *
+ * Affects this wave only -- other waves in the same workgroup, even those
+ * on the same SIMD, keep their existing priority. Takes a few cycles to
+ * take effect.
+ *
+ * Template-parameterized because `s_setprio` requires a compile-time
+ * constant operand.
+ *
+ * @tparam PRIO new priority in [0, 3].
  */
 template<int PRIO>
 __device__ __forceinline__ void set_priority() {
@@ -82,11 +170,20 @@ __device__ __forceinline__ void set_priority() {
 }
 
 /**
- * @brief Bump the priority of every wave in this WG on the same SIMD by N.
+ * @brief Raise the issue priority by `DELTA` for every wave of this
+ *        workgroup currently sharing the **same SIMD** as the caller.
  *
- * Lowers to `s_setprio_inc_wg N`. Useful when one warp wants to nudge
- * the entire WG forward (e.g. a producer warp boosting all WG members
- * once the prologue is past).
+ * Lowers to `s_setprio_inc_wg N`. Useful when one warp wants to pull the
+ * rest of its workgroup forward together -- e.g. a producer warp boosting
+ * the consumer warps once the prologue has loaded the first K-tile.
+ *
+ * The "same SIMD" qualifier matters: a gfx1250 workgroup's waves are spread
+ * across the four SIMDs of a Work-Group Processor, and this only bumps the
+ * members on the caller's SIMD. Waves of the same workgroup on the other
+ * three SIMDs keep their existing priority. Takes a few cycles to take
+ * effect.
+ *
+ * @tparam DELTA priority increment in [0, 3].
  */
 template<int DELTA>
 __device__ __forceinline__ void boost_priority() {
@@ -95,9 +192,15 @@ __device__ __forceinline__ void boost_priority() {
 }
 
 /**
- * @brief Sleep the wave for N cycles.
+ * @brief Park this wave for approximately `N` cycle-groups.
  *
- * Lowers to `s_sleep N`. N is a small immediate (0..15 on gfx12).
+ * Lowers to `s_sleep N`. `N` is a small immediate (`0..15` on gfx12). The
+ * sleep duration is implementation-defined and roughly proportional to
+ * `N` (not exactly `N` clocks) -- treat it as a coarse pacing knob, not
+ * a precise timer. Useful for giving a producer warp some headroom when
+ * a consumer would otherwise spin past the data it needs.
+ *
+ * @tparam N sleep duration code in [0, 15].
  */
 template<int N>
 __device__ __forceinline__ void sleep() {
@@ -105,11 +208,16 @@ __device__ __forceinline__ void sleep() {
 }
 
 /**
- * @brief Compiler-only scheduling fence.
+ * @brief Compiler-only scheduling fence; emits no hardware op.
  *
- * Tells the LLVM scheduler not to reorder instructions across this point
- * but emits no hardware op. Useful when constraining the compiler's WMMA
- * burst grouping without paying a runtime barrier.
+ * Lowers to `__builtin_amdgcn_sched_barrier(0)`, which tells the compiler's
+ * instruction scheduler not to move instructions across this point. Purely
+ * a compile-time hint -- it costs nothing at runtime -- but it pins code
+ * order that the scheduler would otherwise be free to rearrange.
+ *
+ * Typical use: between issuing async loads and the matrix multiplies that
+ * consume them, so the compiler doesn't sink a load past its consumer or
+ * regroup unrelated multiplies together.
  */
 __device__ __forceinline__ void compiler_fence() {
     __builtin_amdgcn_sched_barrier(0);

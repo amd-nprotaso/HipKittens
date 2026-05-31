@@ -81,7 +81,7 @@ void gemm_tdm_arrive_kernel(const gemm_globals g, int M, int N, int K)
     }
     sync::sync();
 
-    sched::expert _sched;
+    sched::expert_scope _sched;
 
     // Per-buffer parity bits. The cell's phase bit starts at 0 and flips
     // each time the pending count drains; `wait_barrier(.., phase ^ 1)`

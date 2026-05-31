@@ -21,7 +21,7 @@ Output dtype is bf16; accumulation is in fp32; default tile is 64x64 with
 | `gemm_padded.cpp`     | `lds_padded<128, 8>` LDS layout (bank-conflict avoidance) + wide `ds_load_b128` s2r.           |
 | `gemm_split_bar.cpp`  | Explicit `sync::arrive()` / `sync::wait()` split.                                              |
 | `gemm_segment.cpp`    | A in `segment<0>`, B in `segment<1>` (distinct LDS read ports).                                |
-| `gemm_expert.cpp`     | `sched::expert` (reuse-B handled by `mma_ABt`'s default zigzag traversal).                     |
+| `gemm_expert.cpp`     | `sched::expert_scope` (reuse-B handled by `mma_ABt`'s default zigzag traversal).               |
 | `gemm_tdm_arrive.cpp` | `load_tdm` + per-operand `barrier_lds`: fine-grained TDM ordering via `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` and a phase-flip wait. |
 
 ## Build
