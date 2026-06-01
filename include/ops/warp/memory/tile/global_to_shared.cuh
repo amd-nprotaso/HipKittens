@@ -419,13 +419,27 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
 /* ========================================================================== *
  * gfx1250 raw-pointer global <-> LDS transfers
  *
- * The gfx1250 family relies on `global_load_async_to_lds_*`,
- * `cluster_load_async_to_lds_*`, and `tensor_load_to_lds` (TDM) which all take
- * raw 16B-aligned LDS pointers and emit single 16B requests per lane (or per
- * warp, for TDM). Padded LDS layouts further complicate offset math, so the
- * gfx1250 path takes raw `T*` LDS slabs plus a compile-time padding descriptor.
- * Kernels allocate the slab via `shared_allocator::allocate_in<segment<I>>`
- * and call these helpers to populate it.
+ * Three hardware paths move a global tile into LDS, all landing straight in
+ * LDS with no VGPR staging:
+ *
+ *   - `global_load_async_to_lds_*`: each active thread copies B bytes
+ *     (B8/B32/B64/B128 = 1/4/8/16 B) from global to LDS, so a b128 load moves
+ *     16 B x 32 threads = 512 B per wave per instruction, into this
+ *     workgroup's LDS. Drained with `wait_async`.
+ *   - `cluster_load_async_to_lds_*`: the same per-wave payload, except the one
+ *     L2 return is broadcast into the LDS of several workgroups in a cluster at
+ *     once (up to ~5x amplification; bypasses L1) -- for workgroup-cluster
+ *     kernels where multiple workgroups want the same tile. Also drained with
+ *     `wait_async`.
+ *   - `tensor_load_to_lds` (TDM): a dedicated DMA-style engine, 
+ *     moves a WHOLE tile per instruction from an SGPR descriptor 
+ *     and does its own address generation. Drained with `wait_tdm`.
+ *
+ * The async builtins take raw 16B-aligned LDS pointers. Padded LDS layouts
+ * complicate offset math, so the gfx1250 path takes raw `T*` LDS slabs plus a
+ * compile-time padding descriptor. Kernels allocate the slab via
+ * `shared_allocator::allocate_in<segment<I>>` and call these helpers to
+ * populate it.
  *
  * Lives in `kittens::g2s::` to avoid colliding with the CDNA `load(ST&, ...)`
  * overloads in the parent `kittens::` namespace.
@@ -543,7 +557,7 @@ __device__ inline void load(T* __restrict__ lds_dst, const GL& src, const COORD&
  * @param  src        Global tile descriptor.
  * @param  idx        Tile coordinate inside `src`.
  * @param  row_stride Element stride between rows in `src`.
- * @param  cluster_mask `M0` cluster multicast mask (0 for single-WG, non-zero for CGA).
+ * @param  cluster_mask `M0` cluster multicast mask (0 for single-WG, non-zero for a workgroup cluster).
  */
 template<typename Pad = lds_nopad, int ROWS = 0, int COLS = 0, int N_THREADS = WARP_THREADS,
          typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>

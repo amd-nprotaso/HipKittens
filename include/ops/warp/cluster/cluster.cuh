@@ -55,7 +55,7 @@ __device__ __host__ __forceinline__ constexpr uint32_t mask(
 /**
  * @brief Cluster-wide split barrier.
  *
- * Outside a CGA cluster this lowers to a workgroup-wide `sync::sync()`. Inside
+ * Outside a cluster this lowers to a workgroup-wide `sync::sync()`. Inside
  * a cluster the same `s_barrier_signal -1 / s_barrier_wait -1` pair extends to
  * every workgroup in the cluster by hardware-managed forwarding.
  */
