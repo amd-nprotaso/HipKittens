@@ -592,9 +592,17 @@ __device__ inline void load_async(T* __restrict__ lds_dst, const GL& src, const 
  *
  * Issues a single `tensor_load_to_lds` instruction whose D# descriptor
  * encodes the 2D tile shape, source tensor extents, row stride, and optional
- * LDS padding. The instruction is issued by every lane of the wave (`EXEC`
- * is ignored) but only `wave 0` of the group should call this -- TDM unit
- * arbitration is per-SIMD-pair, not per-lane.
+ * LDS padding.
+ *
+ * The transfer is issued once by the whole wave, not per thread: it uses no
+ * vector registers (VGPRs) and ignores the active-thread mask, so
+ * which threads are active makes no difference. The entire tile is described
+ * by a small block of scalar registers.
+ *
+ * A WGP has one TDM per SIMD-pair (a gfx1250 WGP is four SIMDx32s grouped into two pairs). 
+ * That single engine handles one request stream and is shared by the waves on its pair, so
+ * extra issuers don't make the copy faster, they just contend for it and use
+ * up its in-flight slots (at most 3 transfers per wave, 6 per SIMD).
  *
  * Drain with `kittens::sync::wait_tdm()`.
  *
