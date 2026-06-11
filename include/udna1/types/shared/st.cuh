@@ -220,8 +220,10 @@ template<typename T> concept all = requires {
 
 /* ----------  WRAPPERS FOR PRETTINESS  ---------- */
 
-template<int _height, int _width, ducks::st_shape::all _shape> using st_bf = st<bf16,  _height, _width, _shape>;
-template<int _height, int _width, ducks::st_shape::all _shape> using st_hf = st<half,  _height, _width, _shape>;
-template<int _height, int _width, ducks::st_shape::all _shape> using st_fl = st<float, _height, _width, _shape>;
-template<int _height, int _width, ducks::st_shape::all _shape> using st_fp8e4m3 = st<fp8e4m3, _height, _width, _shape>;
+// gfx1250 defaults the shared-tile shape to `st_16x32_padded` so the 2-arg
+// `st_bf<R, C>` form resolves without naming a shape.
+template<int _height, int _width, ducks::st_shape::all _shape = ducks::st_shape::st_16x32_padded<>> using st_bf = st<bf16,  _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape = ducks::st_shape::st_16x32_padded<>> using st_hf = st<half,  _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape = ducks::st_shape::st_16x32_padded<>> using st_fl = st<float, _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape = ducks::st_shape::st_16x32_padded<>> using st_fp8e4m3 = st<fp8e4m3, _height, _width, _shape>;
 }

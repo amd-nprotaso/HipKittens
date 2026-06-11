@@ -27,7 +27,6 @@
 
 #pragma once
 
-#ifdef KITTENS_UDNA1
 
 #include "../../../common/common.cuh"
 
@@ -212,4 +211,3 @@ __device__ __forceinline__ void compiler_fence() {
 } // namespace sched
 } // namespace kittens
 
-#endif // KITTENS_UDNA1

@@ -29,16 +29,16 @@ namespace kittens {
 /**
  * @brief Constant representing number of threads in a warp.
  *
- * CDNA generations are wave-64.
+ * gfx1250 (UDNA1) is wave-32.
  */
-constexpr int WARP_THREADS{64};
+constexpr int WARP_THREADS{32};
 
 /**
 
  * @brief Get the warp ID of the current thread.
  * @return The warp ID.
  */
-__device__ __forceinline__ int warpid() { return threadIdx.x >> 6; }
+__device__ __forceinline__ int warpid() { return threadIdx.x >> 5; }
 
 /**
  * @brief Get the number of warps in the threadblock.
@@ -50,7 +50,7 @@ __device__ __forceinline__ int warpid() { return threadIdx.x >> 6; }
  * @brief Get the lane ID of the current thread within its warp.
  * @return The lane ID.
  */
-__device__ __forceinline__ int laneid() { return threadIdx.x & 0x3f; }
+__device__ __forceinline__ int laneid() { return threadIdx.x & 0x1f; }
 
 using i32x2 = int32_t __attribute__((ext_vector_type(2)));
 using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
@@ -109,9 +109,24 @@ __host__ __device__ inline int ceil_div(int a, int b) {
 }
 
 
-constexpr int MAX_SHARED_MEMORY = 160000;
-constexpr int NUM_XCDS = 8;
-constexpr int CUS_PER_XCD = 32;
+/**
+ * @brief gfx1250 LDS capacity constants.
+ *
+ * On gfx1250, the **LDS scratchpad and the L1 data cache are one 384 KB SRAM
+ * pool per Compute Unit (CU)**, partitioned into six 64 KB segments. 
+ * At least one segment must remain L1, leaving up to five segments
+ * (320 KB) addressable as LDS.
+ *
+ * `MAX_SHARED_MEMORY_PER_SEGMENT` is one 64 KB segment; `MAX_SHARED_MEMORY` is
+ * the full addressable LDS across all five segments. A kernel that fits in one
+ * segment requests `MAX_SHARED_MEMORY_PER_SEGMENT`; one that needs more requests
+ * a larger dynamic shared-memory size at launch via `hipFuncSetAttribute`.
+ */
+constexpr int MAX_SHARED_MEMORY_PER_SEGMENT = 65536;
+constexpr int SHARED_MEMORY_NUM_SEGMENTS    = 5;
+constexpr int MAX_SHARED_MEMORY             = MAX_SHARED_MEMORY_PER_SEGMENT * SHARED_MEMORY_NUM_SEGMENTS;
+constexpr int NUM_XCDS = 1;
+constexpr int CUS_PER_XCD = 64;
 constexpr int NUM_CUS = CUS_PER_XCD * NUM_XCDS;
 
 /* ----------  CUSTOM TYPES  ---------- */
@@ -266,6 +281,48 @@ using bytes_16 = HIP_vector_type<float, 4>;
  */
 struct KITTENS_DEFAULT_ALIGN alignment_dummy { int dummy; };
 
+namespace detail {
+/// @brief 16B (`int4`) vector types tagged with the address spaces the gfx1250
+///        `*_load_async_to_lds_b128` builtins require (AS1 = global, AS3 = LDS).
+using i32x4_vec   = int __attribute__((__vector_size__(16)));
+using i32x4_gvec  = int __attribute__((__vector_size__(16))) __attribute__((address_space(1)));
+using i32x4_lvec  = int __attribute__((__vector_size__(16))) __attribute__((address_space(3)));
+} // namespace detail
+
+/**
+ * @brief Compile-time tag selecting an LDS segment for tile placement on gfx1250.
+ *
+ * Background. LDS and L1 share one 384 KB SRAM pool per Compute Unit (CU),
+ * partitioned at dispatch into six 64 KB segments (see `MAX_SHARED_MEMORY`
+ * above). Up to five segments (indices 0..4, total 320 KB) are addressable as
+ * LDS scratchpad; at least one segment must remain L1. By convention we leave
+ * segment 5 as L1, so LDS-tile placement uses indices 0..4.
+ *
+ * Why segments matter. The LDS half of the pool is fronted by two read ports
+ * delivering 256 B/cycle each. The two ports can issue in the same cycle only
+ * when they target **different** segments, so placing operand `A` in
+ * `segment<0>` and operand `B` in `segment<1>` lets the hardware satisfy both
+ * reads in parallel and reach the full 512 B/cycle peak. Co-locating `A` and
+ * `B` in the same segment serialises them at 256 B/cycle.
+ *
+ * @tparam IDX 0..4 -- segment index. The allocator aligns the allocation start
+ * to `IDX * 64 KB` so multiple tiles can share a single segment.
+ */
+template<int IDX>
+struct segment {
+    static_assert(IDX >= 0 && IDX < SHARED_MEMORY_NUM_SEGMENTS,
+                  "segment index must be in [0, 5)");
+    static constexpr int index       = IDX;
+    static constexpr int byte_offset = IDX * MAX_SHARED_MEMORY_PER_SEGMENT;
+};
+
+namespace ducks {
+namespace segment_tag {
+template<typename T> struct is_segment : std::false_type {};
+template<int I>      struct is_segment<::kittens::segment<I>> : std::true_type {};
+template<typename T> concept all = is_segment<T>::value;
+} // namespace segment_tag
+} // namespace ducks
 /**
  * @brief Very simple allocator for dynamic shared memory. Advances pointer and tracks alignments.
  *
@@ -280,6 +337,8 @@ struct KITTENS_DEFAULT_ALIGN alignment_dummy { int dummy; };
 template<int default_alignment=16> 
 struct shared_allocator {
     int *ptr;   ///< Bump cursor; advances on every allocate*() call.
+    int *base;  ///< Frozen origin captured at construction; never moves.
+                ///< Reference point for `allocate_in<segment<IDX>>` segment starts.
 
     private:
         // Recursive template to generate N-dimensional array type
@@ -316,7 +375,7 @@ struct shared_allocator {
         *
         * @param[in] _ptr Pointer to the start of the extern shared memory.
         */
-        __device__ shared_allocator(int *_ptr): ptr(_ptr) {}
+        __device__ shared_allocator(int *_ptr): ptr(_ptr), base(_ptr) {}
         /**
         * @brief Allocate shared memory for a single instance or N-dimensional array of type A.
         * @tparam A The type of the object to allocate.
@@ -349,6 +408,30 @@ struct shared_allocator {
             return *p;
         }
 
+        /**
+        * @brief Allocate shared memory inside a specific LDS segment on gfx1250.
+        *
+        * Positions the allocator pointer at `base + IDX * 64KB` (where `base`
+        * is the dynamic-shared-memory pointer this allocator was constructed
+        * with), then allocates the requested type there. Multiple
+        * `allocate_in<segment<IDX>>` calls into the same segment pack tightly.
+        *
+        * @tparam SEG    A `kittens::segment<IDX>` tag.
+        * @tparam A      The type of the object to allocate.
+        * @tparam dims   Optional array dimensions.
+        */
+        template<typename SEG, typename A, size_t... dims>
+            requires ducks::segment_tag::all<SEG>
+        __device__ inline variadic_array_t<A, dims...>& allocate_in() {
+            int* target = base + (SEG::byte_offset / sizeof(int));
+            // If we've already allocated past the requested segment, keep
+            // packing where we are; otherwise jump forward to the segment.
+            if (ptr < target) ptr = target;
+            using at = variadic_array_t<A, dims...>;
+            at* p = reinterpret_cast<at*>(ptr);
+            ptr += sizeof(at) / sizeof(int);
+            return *p;
+        }
 };
 
 } // namespace kittens

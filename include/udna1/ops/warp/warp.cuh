@@ -12,3 +12,6 @@
 #include "shared/shared.cuh"
 #include "memory/memory.cuh"
 
+#include "sync/sync.cuh"
+#include "sched/sched.cuh"
+#include "cluster/cluster.cuh"

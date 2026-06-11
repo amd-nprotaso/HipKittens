@@ -13,7 +13,6 @@
 
 #pragma once
 
-#ifdef KITTENS_UDNA1
 
 #include "../../../common/common.cuh"
 
@@ -237,4 +236,3 @@ __device__ __forceinline__ void async_barrier_arrive(uint64_t* lds_counter) {
 } // namespace sync
 } // namespace kittens
 
-#endif // KITTENS_UDNA1

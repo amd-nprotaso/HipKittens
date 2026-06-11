@@ -25,6 +25,69 @@ __device__ static inline void mfma161632(      float2 (&D)[2],
     );
 }
 
+/**
+ * @brief gfx1250 WMMA bf16 16x16x32 helper.
+ *
+ * Wraps `__builtin_amdgcn_wmma_f32_16x16x32_bf16` -- the bf16 entry point
+ * into the gfx1250 matrix unit. Instruction shape: A is 16x32 bf16, B is
+ * 32x16 bf16, C/D is 16x16 fp32.
+ *
+ * Operand reuse cache (the `_reuse` template params). The matrix unit has a
+ * small staging cache holding the most recently consumed A and B operand
+ * bundles. If the *next* WMMA call uses the same A and/or B as the current
+ * one, setting the matching `_reuse=true` on that next call tells the
+ * hardware to read the operand from the cache instead of from the VGPR file
+ * -- saving VGPR read bandwidth and easing the VGPR-bank pressure that the
+ * WMMA operand-read path would otherwise create.
+ *
+ * Rules of use:
+ *   - Only set `_reuse=true` on the **second-or-later** call of a contiguous
+ *     burst that shares the operand. The first call has nothing to reuse and
+ *     must be `_reuse=false`.
+ *   - The reusing call must have the **identical opcode** and the **same
+ *     operand VGPR block** as the previous call. Mixing dtypes or changing
+ *     the source register block is undefined.
+ *   - The cache is small -- one slot per operand. The most recent A (or B)
+ *     evicts the previous one.
+ *
+ * Callers normally do not set these hints by hand -- the higher-level
+ * `mma_ABt` derives them from the iteration position in its m-outer/n-inner
+ * zigzag traversal, so passing the defaults here just means "first call of a
+ * burst" and `mma_ABt` overrides them for subsequent calls.
+ *
+ * `D`, `A`, `B`, `C` are the `rt_base::data` arrays:
+ *   - C accumulator: `float2[4]` (8 floats per lane).
+ *   - A operand:     `bf16_2[8]` (16 bf16 per lane).
+ *   - B operand:     `bf16_2[8]` (16 bf16 per lane, row-major for ABt).
+ */
+template<bool A_reuse = false, bool B_reuse = false>
+__device__ static inline void wmma161632(      float2 (&D)[4],
+                                         const bf16_2 (&A)[8],
+                                         const bf16_2 (&B)[8],
+                                         const float2 (&C)[4]) {
+    typedef __attribute__((__vector_size__(16 * sizeof(__bf16)))) __bf16 bf16x16_t;
+    typedef __attribute__((__vector_size__(8 * sizeof(float)))) float floatx8_t;
+    *(floatx8_t*)D = __builtin_amdgcn_wmma_f32_16x16x32_bf16(
+        /*a_neg=*/ false, *(bf16x16_t*)A,
+        /*b_neg=*/ false, *(bf16x16_t*)B,
+        /*c_mod=*/ 0,     *(floatx8_t*)C,
+        A_reuse, B_reuse);
+}
+
+/// @brief gfx1250 WMMA fp16 16x16x32 helper (parallel signature to bf16).
+template<bool A_reuse = false, bool B_reuse = false>
+__device__ static inline void wmma161632(      float2 (&D)[4],
+                                         const half_2 (&A)[8],
+                                         const half_2 (&B)[8],
+                                         const float2 (&C)[4]) {
+    typedef __attribute__((__vector_size__(16 * sizeof(__fp16)))) __fp16 fp16x16_t;
+    typedef __attribute__((__vector_size__(8 * sizeof(float)))) float floatx8_t;
+    *(floatx8_t*)D = __builtin_amdgcn_wmma_f32_16x16x32_f16(
+        /*a_neg=*/ false, *(fp16x16_t*)A,
+        /*b_neg=*/ false, *(fp16x16_t*)B,
+        /*c_mod=*/ 0,     *(floatx8_t*)C,
+        A_reuse, B_reuse);
+}
 
 __device__ static inline void mfma161632(      float2 (&D)[2],
                                          const bf16_2 (&A)[4],
@@ -230,28 +293,17 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
     constexpr int B_stride = B_shape::stride;
     static_assert(A_stride == B_stride, "A and B must have the same stride");
 
+    // gfx1250 WMMA path: `rt_16x16` D + `rt_16x32` A/B shapes. The wave-32 lane
+    // storage gives `elements_per_thread = 256/32 = 8` for the accumulator and
+    // `512/32 = 16` for the operands. The bf16/f16 16x16x32 case routes to the
+    // WMMA builtin.
     if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
                   A_rows == 16 && A_cols == 32 &&
                   B_rows == 16 && B_cols == 32 &&
                   std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
-        mfma161632(d.data, a.data, b.data, c.data);
-    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_32x32> &&
-                  A_rows == 32 && A_cols == 16 &&
-                  B_rows == 32 && B_cols == 16 &&
-                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_32x32>) {
-        mfma323216(d.data, a.data, b.data, c.data);
-    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
-                  A_rows == 16 && A_cols == 128 &&
-                  B_rows == 16 && B_cols == 128 &&
-                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
-        mfma1616128(d.data, a.data, b.data, c.data);
-    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_32x32> &&
-                  A_rows == 32 && A_cols == 64 &&
-                  B_rows == 32 && B_cols == 64 &&
-                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_32x32>) {
-        mfma323264(d.data, a.data, b.data, c.data);
+        wmma161632<A_reuse, B_reuse>(d.data, a.data, b.data, c.data);
     } else {
-        static_assert(false, "Unsupported shape combination");
+        static_assert(false, "Unsupported shape combination for gfx1250 mma_ABt_base");
     }
 }
 
@@ -469,28 +521,32 @@ __device__ static inline void mma_ABt(D &d,
             std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>)
     );
 
-    // CDNA path: n-outer, m-inner row-major. No operand reuse cache.
-    #pragma unroll
-    for(int n = 0; n < D::height; n++) {
-        #pragma unroll
-        for(int m = 0; m < D::width; m++) {
-            mma_ABt_base(
-                d.tiles[n][m],
-                a.tiles[n][0],
-                b.tiles[m][0],
-                c.tiles[n][m]
-            );
-            #pragma unroll
-            for(int k = 1; k < A::width; k++) {
-                mma_ABt_base(
-                    d.tiles[n][m],
-                    a.tiles[n][k],
-                    b.tiles[m][k],
-                    d.tiles[n][m]
-                );
-            }
-        }
-    }
+    // gfx1250: m-outer, n-inner zigzag with reuse hints derived from
+    // (M, S) -- both compile-time template parameters of the nested lambdas.
+    [&]<std::size_t... Ms>(std::index_sequence<Ms...>) {
+        ([&]<std::size_t M>() {
+            [&]<std::size_t... Ss>(std::index_sequence<Ss...>) {
+                ([&]<std::size_t S>() {
+                    constexpr std::size_t n        = (M & 1) ? (D::height - 1 - S) : S;
+                    constexpr bool        B_reuse  = (S > 0);              // within-column
+                    constexpr bool        A_reuse  = (S == 0) && (M > 0);  // column-switch (zigzag)
+                    // k = 0: pull accumulator from `c`.
+                    mma_ABt_base<A_reuse, B_reuse>(
+                        d.tiles[n][M], a.tiles[n][0], b.tiles[M][0], c.tiles[n][M]);
+                    // k >= 1: chain into `d`. A and B both advance, so no reuse.
+                    if constexpr (A::width > 1) {
+                        [&]<std::size_t... Ks>(std::index_sequence<Ks...>) {
+                            ([&]<std::size_t K>() {
+                                constexpr std::size_t k = K + 1;
+                                mma_ABt_base<false, false>(
+                                    d.tiles[n][M], a.tiles[n][k], b.tiles[M][k], d.tiles[n][M]);
+                            }.template operator()<Ks>(), ...);
+                        }(std::make_index_sequence<A::width - 1>{});
+                    }
+                }.template operator()<Ss>(), ...);
+            }(std::make_index_sequence<D::height>{});
+        }.template operator()<Ms>(), ...);
+    }(std::make_index_sequence<D::width>{});
 }
 
 /**

@@ -703,4 +703,81 @@ __device__ inline static void store(ST &dst, const RT &src) {
  * the operand layout consumed directly by `__builtin_amdgcn_wmma_f32_16x16x32_bf16`.
  * ========================================================================== */
 
+/**
+ * @brief Shared -> register load of a warp's tile slice on gfx1250.
+ *
+ * Reads the warp's `WARP_M x WARP_K` region (origin at `warp_origin_flat`) of a
+ * block-level `st` tile into the WMMA bf16 operand layout. The source tile
+ * owns the subtile-major + padding LDS address map, so the caller only supplies
+ * the warp-origin flat index.
+ *
+ * Each 16x32 subtile is filled by two wide `ds_load_b128`s (the 16 `bf16` per
+ * lane that `wmma_f32_16x16x32_bf16` consumes), read from the padded physical
+ * offset `src.data + src.padded(base_flat)`. The bank-conflict padding carried
+ * by the tile shape is what keeps the wide load conflict-free.
+ *
+ * @tparam WARP_M, WARP_K   Per-warp tile dimensions (multiples of 16/32); deduced from `dst`.
+ * @param dst              Destination register tile.
+ * @param src              Source shared tile (`st`, padded layout).
+ * @param warp_origin_flat Row-major flat index of the warp's tile origin in
+ *                         `src` (subtile-aligned; the type applies padding).
+ */
+template<int WARP_M, int WARP_K, typename T, int R, int C, ducks::st_shape::all Shape>
+__device__ inline void load(
+    rt_bf<WARP_M, WARP_K, ducks::rt_layout::row, ducks::rt_shape::rt_16x32>& dst,
+    const st<T, R, C, Shape>& src, int warp_origin_flat)
+{
+    static_assert(Shape::pad_interval > 0,
+        "gfx1250 shared->register load requires a padded tile (e.g. st_bf<R,C>)");
+
+    constexpr int sub_rows     = Shape::rows;
+    constexpr int sub_cols     = Shape::cols;
+    constexpr int sub_elems    = sub_rows * sub_cols;
+    constexpr int height       = WARP_M / sub_rows;
+    constexpr int width        = WARP_K / sub_cols;
+    constexpr int subs_per_row = WARP_K / sub_cols;
+    constexpr int half_cols    = sub_cols / 2;
+
+    const int L    = kittens::laneid();
+    const int row  = L % sub_rows;
+    const int half = L / sub_rows;
+
+    #pragma unroll
+    for (int ti = 0; ti < height; ti++) {
+        #pragma unroll
+        for (int tj = 0; tj < width; tj++) {
+            const int sub_id     = ti * subs_per_row + tj;
+            const int base_flat  = warp_origin_flat
+                                 + sub_id * sub_elems
+                                 + row * sub_cols
+                                 + half * half_cols;
+            const int padded_off = src.padded(base_flat);
+
+            // Two 16B ds_load_b128s fill the 16 bf16 per lane; bank-conflict-free
+            // thanks to the tile's padding.
+            const uint32_t addr = static_cast<uint32_t>(
+                reinterpret_cast<uintptr_t>(src.data + padded_off));
+
+            float4 lo, hi;
+            asm volatile("ds_load_b128 %0, %1 offset:0\n"
+                : "=v"(lo) : "v"(addr) : "memory");
+            asm volatile("ds_load_b128 %0, %1 offset:16\n"
+                : "=v"(hi) : "v"(addr) : "memory");
+
+            bf16_2* lo_p = reinterpret_cast<bf16_2*>(&lo);
+            bf16_2* hi_p = reinterpret_cast<bf16_2*>(&hi);
+
+            dst.tiles[ti][tj].data[0] = lo_p[0];
+            dst.tiles[ti][tj].data[1] = lo_p[1];
+            dst.tiles[ti][tj].data[2] = lo_p[2];
+            dst.tiles[ti][tj].data[3] = lo_p[3];
+            dst.tiles[ti][tj].data[4] = hi_p[0];
+            dst.tiles[ti][tj].data[5] = hi_p[1];
+            dst.tiles[ti][tj].data[6] = hi_p[2];
+            dst.tiles[ti][tj].data[7] = hi_p[3];
+        }
+    }
+}
+
+
 } // namespace kittens

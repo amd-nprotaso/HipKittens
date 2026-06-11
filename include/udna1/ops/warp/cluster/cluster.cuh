@@ -25,7 +25,6 @@
 
 #pragma once
 
-#ifdef KITTENS_UDNA1
 
 #include "../../../common/common.cuh"
 #include "../sync/barrier.cuh"
@@ -66,4 +65,3 @@ __device__ __forceinline__ void sync() {
 } // namespace cluster
 } // namespace kittens
 
-#endif // KITTENS_UDNA1
