@@ -16,8 +16,11 @@ GPU_TARGET ?= CDNA4
 ifeq ($(GPU_TARGET),CDNA4)
   KITTENS_ARCH_DEFINE := -DKITTENS_CDNA4
   KITTENS_OFFLOAD_ARCH := gfx950
+else ifeq ($(GPU_TARGET),UDNA1)
+  KITTENS_ARCH_DEFINE := -DKITTENS_UDNA1
+  KITTENS_OFFLOAD_ARCH := gfx1250
 else
-  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. This build system supports CDNA4 only)
+  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, UDNA1)
 endif
 
 PYTHON ?= python3
