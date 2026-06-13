@@ -169,6 +169,35 @@ __device__ inline void load(st<T, ROWS, COLS, Shape>& dst, const GL& src,
 }
 
 /**
+ * @brief Cooperative register-mediated LDS -> global tile copy (gfx1250).
+ *
+ * Inverse of the register-mediated `load(st, gl, idx, row_stride)`: reads
+ * each element from the tile's subtile-major/padded slot `lds_offset(flat)`
+ * and scatters it back to global memory. Pairs with `load` / `load_async` /
+ * `load_tdm`, which all land data in the same LDS address map.
+ */
+template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
+         ducks::st_shape::all Shape, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
+__device__ inline void store(const GL& dst, const st<T, ROWS, COLS, Shape>& src,
+                             const COORD& idx, int row_stride)
+{
+    constexpr int total_elems = ROWS * COLS;
+    const int tid = threadIdx.x;
+    const int gr_base = idx.r * ROWS;
+    const int gc_base = idx.c * COLS;
+    T* base = dst.raw_ptr
+            + (((int64_t(idx.b) * dst.depth() + idx.d) * dst.rows() + gr_base)
+               * dst.cols() + gc_base);
+
+    #pragma unroll
+    for (int i = tid; i < total_elems; i += N_THREADS) {
+        const int row = i / COLS;
+        const int col = i % COLS;
+        base[row * row_stride + col] = src.data[src.lds_offset(i)];
+    }
+}
+
+/**
  * @brief Cooperative async global -> LDS tile copy on gfx1250.
  *
  * Lowers to `global_load_async_to_lds_b128` (single-WG) when `cluster_mask == 0`,
