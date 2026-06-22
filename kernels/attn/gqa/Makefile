@@ -1,6 +1,6 @@
 GPU_TARGET ?= CDNA4
 TARGET ?= tk_kernel
-PYTHON ?= python3.12
+PYTHON ?= python3
 
 ATTN_B ?= 16
 ATTN_H ?= 64
@@ -22,4 +22,25 @@ endif
 EXTRA_HIPFLAGS += -DHIP_ENABLE_WARP_SYNC_BUILTINS -ffast-math
 EXTRA_ICXXFLAGS += --save-temps
 
+CUSTOM_RULES := 1
 include ../../common.mk
+
+HIP_KERNEL_TARGET := hip_tk_kernel
+HIP_KERNEL_SRC := hip_kernel.cpp
+
+.PHONY: all clean hip_kernel
+
+all: $(TARGET) $(HIP_KERNEL_TARGET)
+
+$(TARGET): $(SRC)
+	$(HIPCXX) $(SRC) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) $(ILDLIBS) \
+		-o $(TARGET)$(PY_EXT_SUFFIX)
+
+$(HIP_KERNEL_TARGET): $(HIP_KERNEL_SRC)
+	$(HIPCXX) $(HIP_KERNEL_SRC) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) $(ILDLIBS) \
+		-o $(HIP_KERNEL_TARGET)$(PY_EXT_SUFFIX)
+
+hip_kernel: $(HIP_KERNEL_TARGET)
+
+clean:
+	rm -f $(TARGET) $(TARGET).*so $(HIP_KERNEL_TARGET) $(HIP_KERNEL_TARGET).*so
