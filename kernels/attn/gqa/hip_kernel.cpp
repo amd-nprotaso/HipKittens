@@ -245,6 +245,11 @@ __device__ __forceinline__ void reinterpret_att(
 }
 
 // ============================================================================
+// Rescale threshold (skip rescaling when max hasn't grown significantly)
+// ============================================================================
+constexpr float RESCALE_THRESHOLD = 8.0f;
+
+// ============================================================================
 // Softmax helpers
 // ============================================================================
 
@@ -406,7 +411,7 @@ __device__ __forceinline__ void prefill_offsets(
 template<bool is_k>
 __device__ __forceinline__ void group_load(
     bf16* smem_base,
-    const int32_t s0, const int32_t s1, const int32_t s2, const int32_t s3,
+    const int32_t s0, const int32_t s1,
     const bf16* global_base,
     int tile_idx, int row_stride,
     const uint32_t (&offsets)[2])
@@ -441,7 +446,7 @@ __device__ __forceinline__ void group_load_srsrc(
     bf16* smem_base,
     int tile_idx, int row_stride,
     const uint32_t (&offsets)[2],
-    int32_t s0, int32_t s1, int32_t s2, int32_t s3,
+    int32_t s0, int32_t s1,
     const bf16* global_base)
 {
     constexpr int BYTES_PER_THREAD = 16;
@@ -738,12 +743,8 @@ __global__ void attend_ker(const attn_globals g) {
 
     const int32_t ks0 = __builtin_amdgcn_readfirstlane(k_srsrc_base.x);
     const int32_t ks1 = __builtin_amdgcn_readfirstlane(k_srsrc_base.y);
-    const int32_t ks2 = __builtin_amdgcn_readfirstlane(k_srsrc_base.z);
-    const int32_t ks3 = __builtin_amdgcn_readfirstlane(k_srsrc_base.w);
     const int32_t vs0 = __builtin_amdgcn_readfirstlane(v_srsrc_base.x);
     const int32_t vs1 = __builtin_amdgcn_readfirstlane(v_srsrc_base.y);
-    const int32_t vs2 = __builtin_amdgcn_readfirstlane(v_srsrc_base.z);
-    const int32_t vs3 = __builtin_amdgcn_readfirstlane(v_srsrc_base.w);
 
     constexpr float TEMPERATURE_SCALE = 0.08838834764f * 1.44269504089f;
     constexpr int num_tiles = NUM_KV_TILES;
@@ -762,6 +763,7 @@ __global__ void attend_ker(const attn_globals g) {
     zero_o(o_reg);
     norm_vec = 0.0f;
     scale_vec = 0.0f;
+    int pending_scale = 0;
 
     // Prefill swizzled offsets
     uint32_t swizzled_offsets_K[2];
@@ -771,7 +773,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Load K[0] into shared
     group_load_srsrc<true>(k_smem_0, 0, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3, k_base);
+                           ks0, ks1, k_base);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -798,9 +800,9 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Load K[1] into shared, V[0] into shared
     group_load_srsrc<true>(k_smem_1, 1, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3, k_base);
+                           ks0, ks1, k_base);
     group_load_srsrc<false>(v_smem_0, 0, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3, v_base);
+                            vs0, vs1, v_base);
 
     // Load K[0] from shared to registers
     load_k_from_shared(k_reg, k_smem_0);
@@ -835,9 +837,9 @@ __global__ void attend_ker(const attn_globals g) {
     // Load K[1] from shared, load K[2] into shared, load V[1] into shared
     load_k_from_shared(k_reg, k_smem_1);
     group_load_srsrc<true>(k_smem_0, 2, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3, k_base);
+                           ks0, ks1, k_base);
     group_load_srsrc<false>(v_smem_1, 1, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3, v_base);
+                            vs0, vs1, v_base);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
     __builtin_amdgcn_sched_barrier(0);
@@ -851,10 +853,12 @@ __global__ void attend_ker(const attn_globals g) {
         // Cluster 0: QK[odd]
         zero_att(att_block[1]);
         transpose_k(k_reg_t, k_reg);
+        if (pending_scale) {
+            norm_vec *= scale_vec;
+        }
         mma_AtB_QK(att_block[1], k_reg_t, q_reg, att_block[1]);
         // Finish softmax for QK[even]
         exp2_base(att_block[0][1]);
-        norm_vec *= scale_vec;
         norm_vec = col_sum_accum(att_block[0], norm_vec);
         copy_f32_to_bf16(att_block_bf16, att_block[0]);
         reinterpret_att(att_block_bf16_in, att_block_bf16);
@@ -866,7 +870,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 1: Load K[j] into shared, load V from shared
         group_load_srsrc<true>(k_smem_1, j, k_row_stride, swizzled_offsets_K,
-                               ks0, ks1, ks2, ks3, k_base);
+                               ks0, ks1, k_base);
         load_v_from_shared(v_reg, v_smem_0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -878,15 +882,24 @@ __global__ void attend_ker(const attn_globals g) {
         __builtin_amdgcn_s_setprio(1);
         mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
         max_vec = col_max_accum(att_block[1], max_vec_prev);
-        scale_vec = max_vec_prev - max_vec;
-        max_vec_prev = max_vec;
-        scale_vec = exp2f(scale_vec);
+        sched_barrier_pairs<4, 5, 2>();
+        {
+            int lane_ok = (max_vec - max_vec_prev <= RESCALE_THRESHOLD) ? 1 : 0;
+            int all_ok  = __all(lane_ok);
+            if (__builtin_expect(all_ok, 1)) {
+                max_vec = max_vec_prev;
+                pending_scale = 0;
+            } else {
+                scale_vec = exp2f(max_vec_prev - max_vec);
+                mul_col_o(o_reg, scale_vec);
+                max_vec_prev = max_vec;
+                pending_scale = 1;
+            }
+        }
         sub_col_att(att_block[1], max_vec);
         exp2_base(att_block[1][0]);
-        sched_barrier_pairs<10, 5, 2>();
+        sched_barrier_pairs<6, 5, 2>();
         sched_barrier_exp_pairs<6, 3, 2>();
-        __builtin_amdgcn_sched_barrier(0);
-        mul_col_o(o_reg, scale_vec);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -894,7 +907,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 3: Load V[j-1] into shared, load K from shared
         group_load_srsrc<false>(v_smem_0, j - 1, v_row_stride, swizzled_offsets_V,
-                                vs0, vs1, vs2, vs3, v_base);
+                                vs0, vs1, v_base);
         load_k_from_shared(k_reg, k_smem_0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -905,10 +918,12 @@ __global__ void attend_ker(const attn_globals g) {
         // Cluster 4: QK[even]
         zero_att(att_block[0]);
         transpose_k(k_reg_t, k_reg);
+        if (pending_scale) {
+            norm_vec *= scale_vec;
+        }
         mma_AtB_QK(att_block[0], k_reg_t, q_reg, att_block[0]);
         // Finish softmax for QK[odd]
         exp2_base(att_block[1][1]);
-        norm_vec *= scale_vec;
         norm_vec = col_sum_accum(att_block[1], norm_vec);
         copy_f32_to_bf16(att_block_bf16, att_block[1]);
         reinterpret_att(att_block_bf16_in, att_block_bf16);
@@ -920,7 +935,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 5: Load K[j+1] into shared, load V from shared
         group_load_srsrc<true>(k_smem_0, j + 1, k_row_stride, swizzled_offsets_K,
-                               ks0, ks1, ks2, ks3, k_base);
+                               ks0, ks1, k_base);
         load_v_from_shared(v_reg, v_smem_1);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -932,15 +947,24 @@ __global__ void attend_ker(const attn_globals g) {
         __builtin_amdgcn_s_setprio(1);
         mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
         max_vec = col_max_accum(att_block[0], max_vec_prev);
-        scale_vec = max_vec_prev - max_vec;
-        max_vec_prev = max_vec;
-        scale_vec = exp2f(scale_vec);
+        sched_barrier_pairs<4, 5, 4>();
+        {
+            int lane_ok = (max_vec - max_vec_prev <= RESCALE_THRESHOLD) ? 1 : 0;
+            int all_ok  = __all(lane_ok);
+            if (__builtin_expect(all_ok, 1)) {
+                max_vec = max_vec_prev;
+                pending_scale = 0;
+            } else {
+                scale_vec = exp2f(max_vec_prev - max_vec);
+                mul_col_o(o_reg, scale_vec);
+                max_vec_prev = max_vec;
+                pending_scale = 1;
+            }
+        }
         sub_col_att(att_block[0], max_vec);
         exp2_base(att_block[0][0]);
-        sched_barrier_pairs<10, 5, 4>();
+        sched_barrier_pairs<6, 5, 4>();
         sched_barrier_exp_pairs<6, 3, 4>();
-        __builtin_amdgcn_sched_barrier(0);
-        mul_col_o(o_reg, scale_vec);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -948,7 +972,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 7: Load V[j] into shared, load K from shared
         group_load_srsrc<false>(v_smem_1, j, v_row_stride, swizzled_offsets_V,
-                                vs0, vs1, vs2, vs3, v_base);
+                                vs0, vs1, v_base);
         load_k_from_shared(k_reg, k_smem_1);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -967,7 +991,9 @@ __global__ void attend_ker(const attn_globals g) {
     mma_AtB_QK(att_block[1], k_reg_t, q_reg, att_block[1]);
     // Finish softmax for QK[last even]
     exp2_base(att_block[0][1]);
-    norm_vec *= scale_vec;
+    if (pending_scale) {
+        norm_vec *= scale_vec;
+    }
     norm_vec = col_sum_accum(att_block[0], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[0]);
     reinterpret_att(att_block_bf16_in, att_block_bf16);
@@ -979,7 +1005,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 1: Load K[num_tiles-1] into shared, load V from shared
     group_load_srsrc<true>(k_smem_1, num_tiles - 1, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3, k_base);
+                           ks0, ks1, k_base);
     load_v_from_shared(v_reg, v_smem_0);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
@@ -1007,7 +1033,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 3: Load V[num_tiles-2] into shared, load K from shared
     group_load_srsrc<false>(v_smem_0, num_tiles - 2, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3, v_base);
+                            vs0, vs1, v_base);
     load_k_from_shared(k_reg, k_smem_0);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
@@ -1058,7 +1084,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 7: Load V[num_tiles-1] into shared, load K from shared
     group_load_srsrc<false>(v_smem_1, num_tiles - 1, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3, v_base);
+                            vs0, vs1, v_base);
     load_k_from_shared(k_reg, k_smem_1);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(2)");
