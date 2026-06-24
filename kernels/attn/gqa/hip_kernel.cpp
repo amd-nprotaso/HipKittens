@@ -113,6 +113,11 @@ __device__ inline int laneid() {
 __device__ inline int warpid() {
     return threadIdx.x / WARP_SIZE;
 }
+__device__ __forceinline__ uint32_t to_sgpr_u32(uint32_t x) {
+    x = __builtin_amdgcn_readfirstlane(x); // make uniform
+    asm volatile("" : "+s"(x));            // keep in SGPR class
+    return x;
+}
 
 // ============================================================================
 // Shared memory swizzle
@@ -466,33 +471,37 @@ __device__ __forceinline__ void group_load(
 // Creates a per-tile srsrc from the tile's global pointer
 template<bool is_k>
 __device__ __forceinline__ void group_load_srsrc(
-    bf16* smem_base,
     int tile_idx, int row_stride,
     const uint32_t (&offsets)[2],
     int32_t s0, int32_t s1,
-    const bf16* global_base)
+    const bf16* global_base,
+    uint32_t lds_base)
 {
     constexpr int BYTES_PER_THREAD = 16;
     constexpr int BYTES_PER_WARP = BYTES_PER_THREAD * WARP_SIZE;
-    constexpr int ELEMS_PER_WARP = BYTES_PER_WARP / 2;
-
-    const int wid = warpid();
+    constexpr int BYTES_PER_MEMCPY = BYTES_PER_THREAD * NUM_THREADS;
 
     // Compute tile pointer: advance by tile_idx * KV_BLOCK_SIZE * stride<1> elements
     const bf16* tile_ptr = global_base + (size_t)tile_idx * KV_BLOCK_SIZE * row_stride;
     i32x4 srsrc = make_srsrc(tile_ptr, (uint32_t)(row_stride * KV_BLOCK_SIZE * 2));
 
-    bf16* lds_base_ptr = smem_base + wid * ELEMS_PER_WARP;
+    // Keep the LDS destination address entirely in SGPRs (via m0), passing a
+    // null VGPR pointer. This stops the compiler from holding per-buffer LDS
+    // addresses live in VGPRs across the whole kernel.
+    uint32_t lds_cur = lds_base;
+    asm volatile("" : "+s"(lds_cur));
 
     #pragma unroll
     for (int i = 0; i < 2; i++) {
-        bf16* lds_elem_ptr = lds_base_ptr + i * NUM_WARPS * ELEMS_PER_WARP;
-        uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_elem_ptr);
-        as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+        int32_t lds_byte = lds_cur;
+        asm volatile("" : "+s"(lds_byte));
+        asm volatile("s_mov_b32 m0, %0" :: "s"(lds_byte));
 
         llvm_amdgcn_raw_buffer_load_lds(
-            srsrc, lds_ptr, BYTES_PER_THREAD,
+            srsrc, (as3_uint32_ptr)0, BYTES_PER_THREAD,
             offsets[i], 0, 0, 0);
+
+        lds_cur += BYTES_PER_MEMCPY;
     }
 }
 
@@ -654,6 +663,30 @@ __device__ __forceinline__ void load_q_global(
     }
 }
 
+// Scale Q in registers by the temperature scale (in place)
+__device__ __forceinline__ void scale_q(float2 (&q_fl)[8][4], float scale) {
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
+        #pragma unroll
+        for (int l = 0; l < 4; l++) {
+            q_fl[j][l].x *= scale;
+            q_fl[j][l].y *= scale;
+        }
+}
+
+// Convert Q from float registers to bf16 (q_fl[8][4] -> q_reg[8][8])
+__device__ __forceinline__ void convert_q_to_bf16(
+    bf16 (&q_reg)[8][8], const float2 (&q_fl)[8][4]) {
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
+        #pragma unroll
+        for (int l = 0; l < 4; l++) {
+            bf16_2 packed = __float22bfloat162_rn(q_fl[j][l]);
+            q_reg[j][2 * l]     = packed.x;
+            q_reg[j][2 * l + 1] = packed.y;
+        }
+}
+
 // ============================================================================
 // Register-to-Global: O store (row_l after transpose, rt_32x32 base, float->bf16)
 // ============================================================================
@@ -749,7 +782,7 @@ __global__ void attend_ker(const attn_globals g) {
     const int batch_idx = blockIdx.z;
     const int head_idx_kv = head_idx / GROUP_SIZE;
     const int block_tile_idx = blockIdx.y;
-    const int tile_idx = block_tile_idx * NUM_WARPS + warpid();
+    const int tile_idx = __builtin_amdgcn_readfirstlane(block_tile_idx * NUM_WARPS + warpid());
     const int stagger = warpid() / 4;
 
     // Readfirstlane hoisting for buffer resources
@@ -771,6 +804,14 @@ __global__ void attend_ker(const attn_globals g) {
     const uint32_t ks1 = __builtin_amdgcn_readfirstlane(k_srsrc_base.y);
     const uint32_t vs0 = __builtin_amdgcn_readfirstlane(v_srsrc_base.x);
     const uint32_t vs1 = __builtin_amdgcn_readfirstlane(v_srsrc_base.y);
+
+    // Per-warp LDS destination bases, hoisted into SGPRs (wave-uniform).
+    constexpr uint32_t LDS_BYTES_PER_WARP = 16 * WARP_SIZE; // BYTES_PER_THREAD * WARP_SIZE
+    const uint32_t lds_warp_off = (uint32_t)(warpid() * LDS_BYTES_PER_WARP);
+    const uint32_t k_lds_base_0 = to_sgpr_u32((uint32_t)reinterpret_cast<uintptr_t>(k_smem_0) + lds_warp_off);
+    const uint32_t k_lds_base_1 = to_sgpr_u32((uint32_t)reinterpret_cast<uintptr_t>(k_smem_1) + lds_warp_off);
+    const uint32_t v_lds_base_0 = to_sgpr_u32((uint32_t)reinterpret_cast<uintptr_t>(v_smem_0) + lds_warp_off);
+    const uint32_t v_lds_base_1 = to_sgpr_u32((uint32_t)reinterpret_cast<uintptr_t>(v_smem_1) + lds_warp_off);
 
     constexpr float TEMPERATURE_SCALE = (D == 128) ? 0.08838834764f*1.44269504089f : 0.125f*1.44269504089f;
     constexpr int num_tiles = NUM_KV_TILES;
@@ -799,8 +840,8 @@ __global__ void attend_ker(const attn_globals g) {
     prefill_offsets<false>(swizzled_offsets_V, g.V_stride1);
 
     // Load K[0] into shared
-    group_load_srsrc<true>(k_smem_0, 0, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, k_base);
+    group_load_srsrc<true>(0, k_row_stride, swizzled_offsets_K,
+                           ks0, ks1, k_base, k_lds_base_0);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -811,29 +852,16 @@ __global__ void attend_ker(const attn_globals g) {
     load_q_global(q_reg_fl, g.Q, g.Q_stride1, batch_idx, tile_idx, head_idx);
 
     // Scale Q
-    #pragma unroll
-    for (int j = 0; j < 8; j++)
-        #pragma unroll
-        for (int l = 0; l < 4; l++) {
-            q_reg_fl[j][l].x *= TEMPERATURE_SCALE;
-            q_reg_fl[j][l].y *= TEMPERATURE_SCALE;
-        }
+    scale_q(q_reg_fl, TEMPERATURE_SCALE);
 
     // Convert float -> bf16
-    #pragma unroll
-    for (int j = 0; j < 8; j++)
-        #pragma unroll
-        for (int l = 0; l < 4; l++) {
-            bf16_2 packed = __float22bfloat162_rn(q_reg_fl[j][l]);
-            q_reg[0][j][2 * l]     = packed.x;
-            q_reg[0][j][2 * l + 1] = packed.y;
-        }
+    convert_q_to_bf16(q_reg[0], q_reg_fl);
 
     // Load K[1] into shared, V[0] into shared
-    group_load_srsrc<true>(k_smem_1, 1, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, k_base);
-    group_load_srsrc<false>(v_smem_0, 0, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, v_base);
+    group_load_srsrc<true>(1, k_row_stride, swizzled_offsets_K,
+                           ks0, ks1, k_base, k_lds_base_1);
+    group_load_srsrc<false>(0, v_row_stride, swizzled_offsets_V,
+                            vs0, vs1, v_base, v_lds_base_0);
 
     // Load K[0] from shared to registers
     load_k_from_shared(k_reg, k_smem_0);
@@ -865,10 +893,10 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Load K[1] from shared, load K[2] into shared, load V[1] into shared
     load_k_from_shared(k_reg, k_smem_1);
-    group_load_srsrc<true>(k_smem_0, 2, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, k_base);
-    group_load_srsrc<false>(v_smem_1, 1, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, v_base);
+    group_load_srsrc<true>(2, k_row_stride, swizzled_offsets_K,
+                           ks0, ks1, k_base, k_lds_base_0);
+    group_load_srsrc<false>(1, v_row_stride, swizzled_offsets_V,
+                            vs0, vs1, v_base, v_lds_base_1);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
     __builtin_amdgcn_sched_barrier(0);
@@ -900,8 +928,8 @@ __global__ void attend_ker(const attn_globals g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 1: Load K[j] into shared, load V from shared
-        group_load_srsrc<true>(k_smem_1, j, k_row_stride, swizzled_offsets_K,
-                               ks0, ks1, k_base);
+        group_load_srsrc<true>(j, k_row_stride, swizzled_offsets_K,
+                               ks0, ks1, k_base, k_lds_base_1);
         load_v_from_shared(v_reg, v_smem_0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -941,8 +969,8 @@ __global__ void attend_ker(const attn_globals g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 3: Load V[j-1] into shared, load K from shared
-        group_load_srsrc<false>(v_smem_0, j - 1, v_row_stride, swizzled_offsets_V,
-                                vs0, vs1, v_base);
+        group_load_srsrc<false>(j - 1, v_row_stride, swizzled_offsets_V,
+                                vs0, vs1, v_base, v_lds_base_0);
         load_k_from_shared(k_reg, k_smem_0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -968,8 +996,8 @@ __global__ void attend_ker(const attn_globals g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 5: Load K[j+1] into shared, load V from shared
-        group_load_srsrc<true>(k_smem_0, j + 1, k_row_stride, swizzled_offsets_K,
-                               ks0, ks1, k_base);
+        group_load_srsrc<true>(j + 1, k_row_stride, swizzled_offsets_K,
+                               ks0, ks1, k_base, k_lds_base_0);
         load_v_from_shared(v_reg, v_smem_1);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -982,9 +1010,9 @@ __global__ void attend_ker(const attn_globals g) {
         mma_AtB_OV_slice(o_reg, v_reg[0], att_block_bf16_in[0]);
         max_vec = col_max_accum(att_block[0], max_vec_prev);
         sched_barrier_pairs<4, 5, 4>();
-        
-        int lane_ok = lane_below(max_vec_prev, max_vec, RESCALE_THRESHOLD);
-        int all_ok  = wave_all_ok(lane_ok);
+
+        lane_ok = lane_below(max_vec_prev, max_vec, RESCALE_THRESHOLD);
+        all_ok  = wave_all_ok(lane_ok);
         if (__builtin_expect(all_ok, 1)) {
             max_vec = max_vec_prev;
             pending_scale = 0;
@@ -1009,8 +1037,8 @@ __global__ void attend_ker(const attn_globals g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 7: Load V[j] into shared, load K from shared
-        group_load_srsrc<false>(v_smem_1, j, v_row_stride, swizzled_offsets_V,
-                                vs0, vs1, v_base);
+        group_load_srsrc<false>(j, v_row_stride, swizzled_offsets_V,
+                                vs0, vs1, v_base, v_lds_base_1);
         load_k_from_shared(k_reg, k_smem_1);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -1039,8 +1067,8 @@ __global__ void attend_ker(const attn_globals g) {
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 1: Load K[num_tiles-1] into shared, load V from shared
-    group_load_srsrc<true>(k_smem_1, num_tiles - 1, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, k_base);
+    group_load_srsrc<true>(num_tiles - 1, k_row_stride, swizzled_offsets_K,
+                           ks0, ks1, k_base, k_lds_base_1);
     load_v_from_shared(v_reg, v_smem_0);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
@@ -1067,8 +1095,8 @@ __global__ void attend_ker(const attn_globals g) {
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 3: Load V[num_tiles-2] into shared, load K from shared
-    group_load_srsrc<false>(v_smem_0, num_tiles - 2, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, v_base);
+    group_load_srsrc<false>(num_tiles - 2, v_row_stride, swizzled_offsets_V,
+                            vs0, vs1, v_base, v_lds_base_0);
     load_k_from_shared(k_reg, k_smem_0);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
@@ -1117,8 +1145,8 @@ __global__ void attend_ker(const attn_globals g) {
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 7: Load V[num_tiles-1] into shared, load K from shared
-    group_load_srsrc<false>(v_smem_1, num_tiles - 1, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, v_base);
+    group_load_srsrc<false>(num_tiles - 1, v_row_stride, swizzled_offsets_V,
+                            vs0, vs1, v_base, v_lds_base_1);
     load_k_from_shared(k_reg, k_smem_1);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(2)");
