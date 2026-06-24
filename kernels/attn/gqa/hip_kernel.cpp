@@ -28,10 +28,6 @@ constexpr int ATTN_N = 1024;
 constexpr int ATTN_D = 128;
 constexpr int Q_BLOCK_SIZE = 32;
 constexpr int KV_BLOCK_SIZE = 64;
-// Number of 32-wide query column-tiles in the attention block.
-// This is the per-lane length of the softmax row-vectors (max/norm/scale),
-// mirroring attn_tile::row_vec::outer_dim in the reference kernel.cpp.
-constexpr int ATT_WIDTH = Q_BLOCK_SIZE / 32;
 #define NUM_WARPS 8
 constexpr int WARP_SIZE = 64;
 #define NUM_THREADS (WARP_SIZE * NUM_WARPS)
@@ -170,20 +166,17 @@ __device__ __forceinline__ void sched_barrier_exp_pairs() {
 //   D(height=2,width=1), A(height=8,width=2), B(height=8,width=1)
 // ============================================================================
 __device__ __forceinline__ void mma_AtB_QK(
-    float2 (&D)[2][ATT_WIDTH][8],
+    float2 (&D)[2][8],
     const bf16_2 (&A)[8][2][4],
-    const bf16_2 (&B)[ATT_WIDTH][8][4],
-    const float2 (&C)[2][ATT_WIDTH][8])
+    const bf16_2 (&B)[8][4],
+    const float2 (&C)[2][8])
 {
     #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) {
+    for (int n = 0; n < 2; n++) {
+        mfma_f32_32x32x16_bf16(D[n], A[0][n], B[0], C[n]);
         #pragma unroll
-        for (int n = 0; n < 2; n++) {
-            mfma_f32_32x32x16_bf16(D[n][w], A[0][n], B[w][0], C[n][w]);
-            #pragma unroll
-            for (int k = 1; k < 8; k++) {
-                mfma_f32_32x32x16_bf16(D[n][w], A[k][n], B[w][k], D[n][w]);
-            }
+        for (int k = 1; k < 8; k++) {
+            mfma_f32_32x32x16_bf16(D[n], A[k][n], B[k], D[n]);
         }
     }
 }
@@ -194,20 +187,17 @@ __device__ __forceinline__ void mma_AtB_QK(
 //   D(height=4,width=1), A(height=4,width=4), B(height=4,width=1)
 // ============================================================================
 __device__ __forceinline__ void mma_AtB_OV(
-    float2 (&D)[4][ATT_WIDTH][8],
+    float2 (&D)[4][8],
     const bf16_2 (&A)[4][4][4],
-    const bf16_2 (&B)[ATT_WIDTH][4][4],
-    const float2 (&C)[4][ATT_WIDTH][8])
+    const bf16_2 (&B)[4][4],
+    const float2 (&C)[4][8])
 {
     #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) {
+    for (int n = 0; n < 4; n++) {
+        mfma_f32_32x32x16_bf16(D[n], A[0][n], B[0], C[n]);
         #pragma unroll
-        for (int n = 0; n < 4; n++) {
-            mfma_f32_32x32x16_bf16(D[n][w], A[0][n], B[w][0], C[n][w]);
-            #pragma unroll
-            for (int k = 1; k < 4; k++) {
-                mfma_f32_32x32x16_bf16(D[n][w], A[k][n], B[w][k], D[n][w]);
-            }
+        for (int k = 1; k < 4; k++) {
+            mfma_f32_32x32x16_bf16(D[n], A[k][n], B[k], D[n]);
         }
     }
 }
@@ -231,15 +221,13 @@ __device__ __forceinline__ void transpose_k(
 // Copy float2 -> bf16_2 (att_block -> att_block_bf16)
 // ============================================================================
 __device__ __forceinline__ void copy_f32_to_bf16(
-    bf16_2 (&dst)[2][ATT_WIDTH][8], const float2 (&src)[2][ATT_WIDTH][8])
+    bf16_2 (&dst)[2][8], const float2 (&src)[2][8])
 {
     #pragma unroll
     for (int i = 0; i < 2; i++)
         #pragma unroll
-        for (int j = 0; j < ATT_WIDTH; j++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++)
-                dst[i][j][k] = __float22bfloat162_rn(src[i][j][k]);
+        for (int k = 0; k < 8; k++)
+            dst[i][k] = __float22bfloat162_rn(src[i][k]);
 }
 
 // ============================================================================
@@ -247,178 +235,111 @@ __device__ __forceinline__ void copy_f32_to_bf16(
 // dst[i][k] = src[i/2][(i%2)*4 + k]
 // ============================================================================
 __device__ __forceinline__ void reinterpret_att(
-    bf16_2 (&dst)[ATT_WIDTH][4][4], const bf16_2 (&src)[2][ATT_WIDTH][8])
+    bf16_2 (&dst)[4][4], const bf16_2 (&src)[2][8])
 {
     #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++)
+    for (int i = 0; i < 4; i++)
         #pragma unroll
-        for (int i = 0; i < 4; i++)
-            #pragma unroll
-            for (int k = 0; k < 4; k++)
-                dst[j][i][k] = src[i / 2][j][(i % 2) * 4 + k];
-}
-
-// ============================================================================
-// Rescale threshold (skip rescaling when max hasn't grown significantly)
-// ============================================================================
-constexpr float RESCALE_THRESHOLD = 8.0f;
-
-// ============================================================================
-// Row-vector (per-width) helpers for the softmax accumulators
-// ============================================================================
-__device__ __forceinline__ void rv_copy(float (&dst)[ATT_WIDTH], const float (&src)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) dst[w] = src[w];
-}
-__device__ __forceinline__ void rv_exp2(float (&v)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) v[w] = exp2f(v[w]);
-}
-__device__ __forceinline__ void rv_mul(float (&dst)[ATT_WIDTH], const float (&src)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) dst[w] *= src[w];
-}
-// scale_vec = exp2(prev - cur), per width
-__device__ __forceinline__ void rv_diff_exp2(
-    float (&dst)[ATT_WIDTH], const float (&prev)[ATT_WIDTH], const float (&cur)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) dst[w] = exp2f(prev[w] - cur[w]);
-}
-// true iff EVERY width slot is within threshold (wave-uniform vote)
-__device__ __forceinline__ int rv_all_below(
-    const float (&prev)[ATT_WIDTH], const float (&cur)[ATT_WIDTH], float thresh) {
-    int ok = 1;
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) ok &= (cur[w] - prev[w] <= thresh);
-    return __all(ok);
+        for (int k = 0; k < 4; k++)
+            dst[i][k] = src[i / 2][(i % 2) * 4 + k];
 }
 
 // ============================================================================
 // Softmax helpers
 // ============================================================================
 
-// col_max: per-width column reduction of the att tile to its row-vector.
-// For each of the ATT_WIDTH query column-tiles, reduce the in-lane elements
-// (height x packed) then merge the two 32-row halves with permlane32_swap.
-// Mirrors col_reduce<max> over a col_l rt_32x32 tile in the reference.
-__device__ __forceinline__ void col_max_reset(
-    float (&mx)[ATT_WIDTH], const float2 (&data)[2][ATT_WIDTH][8]) {
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++) {
-        float m = -__builtin_huge_valf();
-        #pragma unroll
-        for (int i = 0; i < 2; i++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++) {
-                m = __builtin_fmaxf(m, data[i][j][k].x);
-                m = __builtin_fmaxf(m, data[i][j][k].y);
-            }
-        uint2_t res = __builtin_amdgcn_permlane32_swap(
-            __float_as_uint(m), __float_as_uint(m), false, true);
-        mx[j] = __builtin_fmaxf(__uint_as_float(res.x), __uint_as_float(res.y));
-    }
-}
-
-// col_max accumulating onto a previous row-vector (per width).
-__device__ __forceinline__ void col_max_accum(
-    float (&mx)[ATT_WIDTH], const float2 (&data)[2][ATT_WIDTH][8],
-    const float (&prev)[ATT_WIDTH]) {
-    col_max_reset(mx, data);
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++)
-        mx[j] = __builtin_fmaxf(mx[j], prev[j]);
-}
-
-// col_sum: per-width column reduction, accumulating onto prev row-vector.
-__device__ __forceinline__ void col_sum_accum(
-    float (&sm_out)[ATT_WIDTH], const float2 (&data)[2][ATT_WIDTH][8],
-    const float (&prev)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++) {
-        float sm = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 2; i++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++) {
-                sm += data[i][j][k].x;
-                sm += data[i][j][k].y;
-            }
-        uint2_t res = __builtin_amdgcn_permlane32_swap(
-            __float_as_uint(sm), __float_as_uint(sm), false, true);
-        sm = __uint_as_float(res.x) + __uint_as_float(res.y);
-        sm_out[j] = prev[j] + sm;
-    }
-}
-
-// sub_col: subtract the per-width row-vector value from each column.
-__device__ __forceinline__ void sub_col_att(
-    float2 (&data)[2][ATT_WIDTH][8], const float (&val)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++) {
-        #pragma unroll
-        for (int i = 0; i < 2; i++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++) {
-                data[i][j][k].x -= val[j];
-                data[i][j][k].y -= val[j];
-            }
-    }
-}
-
-// exp2 on one height-row of the att tile, across all ATT_WIDTH column-tiles.
-__device__ __forceinline__ void exp2_base(float2 (&data)[ATT_WIDTH][8]) {
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++)
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            data[j][k].x = exp2f(data[j][k].x);
-            data[j][k].y = exp2f(data[j][k].y);
-        }
-}
-
-// mul_col on o_reg[4][8] by the per-width row-vector.
-// o_reg (D x Q, col_l rt_32x32) has width == ATT_WIDTH; for Q_BLOCK_SIZE=32
-// width is 1, so every D-subtile is scaled by val[0].
-__device__ __forceinline__ void mul_col_o(float2 (&data)[4][ATT_WIDTH][8], const float (&val)[ATT_WIDTH]) {
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++)
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++) {
-                data[i][j][k].x *= val[j];
-                data[i][j][k].y *= val[j];
-            }
-}
-
-// div_col on o_reg by the per-width row-vector.
-__device__ __forceinline__ void div_col_o(float2 (&data)[4][ATT_WIDTH][8], const float (&val)[ATT_WIDTH]) {
-    float inv[ATT_WIDTH];
-    #pragma unroll
-    for (int j = 0; j < ATT_WIDTH; j++) inv[j] = 1.0f / val[j];
-    mul_col_o(data, inv);
-}
-
-// zero out o_reg (height x width x packed)
-__device__ __forceinline__ void zero_o(float2 (&data)[4][ATT_WIDTH][8]) {
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        #pragma unroll
-        for (int j = 0; j < ATT_WIDTH; j++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++)
-                data[i][j][k] = {0.0f, 0.0f};
-}
-
-// zero out att_block (height x width x packed)
-__device__ __forceinline__ void zero_att(float2 (&data)[2][ATT_WIDTH][8]) {
+// col_max: reduce float2[2][8] to scalar, with cross-lane permlane32_swap
+__device__ __forceinline__ float col_max_reset(const float2 (&data)[2][8]) {
+    float mx = -__builtin_huge_valf();
     #pragma unroll
     for (int i = 0; i < 2; i++)
         #pragma unroll
-        for (int j = 0; j < ATT_WIDTH; j++)
-            #pragma unroll
-            for (int k = 0; k < 8; k++)
-                data[i][j][k] = {0.0f, 0.0f};
+        for (int k = 0; k < 8; k++) {
+            mx = __builtin_fmaxf(mx, data[i][k].x);
+            mx = __builtin_fmaxf(mx, data[i][k].y);
+        }
+    uint2_t res = __builtin_amdgcn_permlane32_swap(
+        __float_as_uint(mx), __float_as_uint(mx), false, true);
+    mx = __builtin_fmaxf(__uint_as_float(res.x), __uint_as_float(res.y));
+    return mx;
+}
+
+// col_max with previous accumulator
+__device__ __forceinline__ float col_max_accum(const float2 (&data)[2][8], float prev) {
+    float mx = col_max_reset(data);
+    return __builtin_fmaxf(mx, prev);
+}
+
+// col_sum: reduce float2[2][8] to scalar, accumulate onto prev
+__device__ __forceinline__ float col_sum_accum(const float2 (&data)[2][8], float prev) {
+    float sm = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            sm += data[i][k].x;
+            sm += data[i][k].y;
+        }
+    uint2_t res = __builtin_amdgcn_permlane32_swap(
+        __float_as_uint(sm), __float_as_uint(sm), false, true);
+    sm = __uint_as_float(res.x) + __uint_as_float(res.y);
+    return prev + sm;
+}
+
+// sub_col: data[i][k] -= val (broadcast scalar to float2)
+__device__ __forceinline__ void sub_col_att(float2 (&data)[2][8], float val) {
+    float2 packed = {val, val};
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            data[i][k].x -= packed.x;
+            data[i][k].y -= packed.y;
+        }
+}
+
+// exp2 on a single base tile [8]
+__device__ __forceinline__ void exp2_base(float2 (&data)[8]) {
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        data[k].x = exp2f(data[k].x);
+        data[k].y = exp2f(data[k].y);
+    }
+}
+
+// mul_col on o_reg[4][8] by scalar
+__device__ __forceinline__ void mul_col_o(float2 (&data)[4][8], float val) {
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            data[i][k].x *= val;
+            data[i][k].y *= val;
+        }
+}
+
+// div_col on o_reg[4][8] by scalar
+__device__ __forceinline__ void div_col_o(float2 (&data)[4][8], float val) {
+    float inv = 1.0f / val;
+    mul_col_o(data, inv);
+}
+
+// zero out o_reg
+__device__ __forceinline__ void zero_o(float2 (&data)[4][8]) {
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            data[i][k] = {0.0f, 0.0f};
+}
+
+// zero out att_block
+__device__ __forceinline__ void zero_att(float2 (&data)[2][8]) {
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            data[i][k] = {0.0f, 0.0f};
 }
 
 // ============================================================================
@@ -485,7 +406,7 @@ __device__ __forceinline__ void prefill_offsets(
 template<bool is_k>
 __device__ __forceinline__ void group_load(
     bf16* smem_base,
-    const int32_t s0, const int32_t s1,
+    const int32_t s0, const int32_t s1, const int32_t s2, const int32_t s3,
     const bf16* global_base,
     int tile_idx, int row_stride,
     const uint32_t (&offsets)[2])
@@ -513,17 +434,15 @@ __device__ __forceinline__ void group_load(
     }
 }
 
-// Version using pre-hoisted SGPR srsrc components.
-// Reconstructs the strided base buffer resource (built once over the whole
-// K/V tensor for this batch/head) from its four hoisted dwords, and selects
-// the current KV tile via a scalar byte offset (SOFF) instead of rebuilding a
-// per-tile srsrc. Mirrors the reference load() in kernel.cpp.
+// Version using pre-hoisted SGPR srsrc components
+// Creates a per-tile srsrc from the tile's global pointer
 template<bool is_k>
 __device__ __forceinline__ void group_load_srsrc(
     bf16* smem_base,
     int tile_idx, int row_stride,
     const uint32_t (&offsets)[2],
-    int32_t s0, int32_t s1, int32_t s2, int32_t s3)
+    int32_t s0, int32_t s1,
+    const bf16* global_base)
 {
     constexpr int BYTES_PER_THREAD = 16;
     constexpr int BYTES_PER_WARP = BYTES_PER_THREAD * WARP_SIZE;
@@ -531,15 +450,9 @@ __device__ __forceinline__ void group_load_srsrc(
 
     const int wid = warpid();
 
-    // Rebuild the hoisted strided base srsrc {x,y,z,w}.
-    i32x4 srsrc;
-    srsrc.x = s0;
-    srsrc.y = s1;
-    srsrc.z = s2;
-    srsrc.w = s3;
-
-    // Scalar byte offset of this KV tile from the base pointer (tile 0).
-    const uint32_t soff = (uint32_t)((size_t)tile_idx * KV_BLOCK_SIZE * row_stride * 2);
+    // Compute tile pointer: advance by tile_idx * KV_BLOCK_SIZE * stride<1> elements
+    const bf16* tile_ptr = global_base + (size_t)tile_idx * KV_BLOCK_SIZE * row_stride;
+    i32x4 srsrc = make_srsrc(tile_ptr, (uint32_t)(row_stride * KV_BLOCK_SIZE * 2));
 
     bf16* lds_base_ptr = smem_base + wid * ELEMS_PER_WARP;
 
@@ -551,7 +464,7 @@ __device__ __forceinline__ void group_load_srsrc(
 
         llvm_amdgcn_raw_buffer_load_lds(
             srsrc, lds_ptr, BYTES_PER_THREAD,
-            offsets[i], soff, 0, 0);
+            offsets[i], 0, 0, 0);
     }
 }
 
@@ -674,7 +587,7 @@ __device__ __forceinline__ void load_v_from_shared(
 // ============================================================================
 __device__ __forceinline__ void load_q_global(
     float2 (&q_fl)[8][4],
-    const bf16* Q_ptr, int row_stride, int batch, int tile, int head, int w)
+    const bf16* Q_ptr, int row_stride, int batch, int tile, int head)
 {
     const int lid = laneid();
     const int row_offset = lid % 32;
@@ -685,10 +598,8 @@ __device__ __forceinline__ void load_q_global(
     // For float register tile: packed element is float2. stride/packing = 8/2 = 4.
     // num_strides = 1
 
-    // w selects the 32-query column-tile within the Q block (one per ATT_WIDTH).
     const bf16* base = Q_ptr + (size_t)batch * ATTN_N * ATTN_H * ATTN_D
                      + (size_t)tile * Q_BLOCK_SIZE * ATTN_H * ATTN_D
-                     + (size_t)w * 32 * ATTN_H * ATTN_D
                      + (size_t)head * ATTN_D;
 
     uint32_t buf_size = ATTN_B * ATTN_N * ATTN_H * ATTN_D * 2;
@@ -719,7 +630,7 @@ __device__ __forceinline__ void load_q_global(
 // Register-to-Global: O store (row_l after transpose, rt_32x32 base, float->bf16)
 // ============================================================================
 __device__ __forceinline__ void store_o_global(
-    const bf16* O_ptr, const float2 (&o_out)[4][ATT_WIDTH][8],
+    const bf16* O_ptr, const float2 (&o_out)[4][8],
     int row_stride, int batch, int tile, int head)
 {
     const int lid = laneid();
@@ -750,7 +661,7 @@ __device__ __forceinline__ void store_o_global(
 
             #pragma unroll
             for (int l = 0; l < 2; l++) {
-                tmp[l] = __float22bfloat162_rn(o_out[j][0][idx + l]);
+                tmp[l] = __float22bfloat162_rn(o_out[j][idx + l]);
             }
             uint64_t val = *reinterpret_cast<uint64_t*>(tmp);
             llvm_amdgcn_raw_buffer_store_b64(
@@ -766,12 +677,11 @@ __device__ __forceinline__ void store_o_global(
 // ============================================================================
 __device__ __forceinline__ void store_lse_global(
     const float* L_ptr, float val,
-    int L_dim3, int batch, int head, int tile, int w)
+    int L_dim3, int batch, int head, int tile)
 {
     const int lid = laneid();
     if (lid < 32) {
-        // w selects the 32-query column-tile within the Q block.
-        int seq_pos = tile * Q_BLOCK_SIZE + w * 32 + lid;
+        int seq_pos = tile * Q_BLOCK_SIZE + lid;
         const float* base = L_ptr + (size_t)batch * ATTN_H * 1 * L_dim3
                           + (size_t)head * 1 * L_dim3
                           + (size_t)seq_pos;
@@ -807,7 +717,7 @@ __global__ void attend_ker(const attn_globals g) {
     bf16* v_smem_0 = k_smem_1 + KV_BLOCK_SIZE * ATTN_D;
     bf16* v_smem_1 = v_smem_0 + KV_BLOCK_SIZE * ATTN_D;
 
-    const int head_idx = (blockIdx.x % GROUP_SIZE) * GROUP_SIZE + (blockIdx.x / GROUP_SIZE);
+    const int head_idx = (blockIdx.x % ATTN_H_KV) * GROUP_SIZE + (blockIdx.x / ATTN_H_KV);
     const int batch_idx = blockIdx.z;
     const int head_idx_kv = head_idx / GROUP_SIZE;
     const int block_tile_idx = blockIdx.y;
@@ -823,41 +733,34 @@ __global__ void attend_ker(const attn_globals g) {
     const int k_row_stride = g.K_stride1;
     const int v_row_stride = g.V_stride1;
 
-    i32x4 k_srsrc_base = make_srsrc(k_base, (uint32_t)(k_row_stride * ATTN_N * 2), (uint32_t)(k_row_stride * 2));
-    i32x4 v_srsrc_base = make_srsrc(v_base, (uint32_t)(v_row_stride * ATTN_N * 2), (uint32_t)(v_row_stride * 2));
+    const int k_row_stride_bytes = k_row_stride * (int)sizeof(bf16);
+    const int v_row_stride_bytes = v_row_stride * (int)sizeof(bf16);
 
-    const int32_t ks0 = __builtin_amdgcn_readfirstlane(k_srsrc_base.x);
-    const int32_t ks1 = __builtin_amdgcn_readfirstlane(k_srsrc_base.y);
-    const int32_t ks2 = __builtin_amdgcn_readfirstlane(k_srsrc_base.z);
-    const int32_t ks3 = __builtin_amdgcn_readfirstlane(k_srsrc_base.w);
-    const int32_t vs0 = __builtin_amdgcn_readfirstlane(v_srsrc_base.x);
-    const int32_t vs1 = __builtin_amdgcn_readfirstlane(v_srsrc_base.y); 
-    const int32_t vs2 = __builtin_amdgcn_readfirstlane(v_srsrc_base.z);
-    const int32_t vs3 = __builtin_amdgcn_readfirstlane(v_srsrc_base.w);
+    i32x4 k_srsrc_base = make_srsrc(k_base, (uint32_t)(k_row_stride_bytes * ATTN_N), (uint32_t)k_row_stride_bytes);
+    i32x4 v_srsrc_base = make_srsrc(v_base, (uint32_t)(v_row_stride_bytes * ATTN_N), (uint32_t)v_row_stride_bytes);
+
+    const uint32_t ks0 = __builtin_amdgcn_readfirstlane(k_srsrc_base.x);
+    const uint32_t ks1 = __builtin_amdgcn_readfirstlane(k_srsrc_base.y);
+    const uint32_t vs0 = __builtin_amdgcn_readfirstlane(v_srsrc_base.x);
+    const uint32_t vs1 = __builtin_amdgcn_readfirstlane(v_srsrc_base.y);
 
     constexpr float TEMPERATURE_SCALE = 0.08838834764f * 1.44269504089f;
     constexpr int num_tiles = NUM_KV_TILES;
 
-    // Register tiles. ATT_WIDTH is the number of 32-wide query column-tiles in
-    // the attention block (== Q_BLOCK_SIZE/32); the softmax row-vectors carry
-    // one value per width slot, mirroring attn_tile::row_vec in kernel.cpp.
-    bf16_2 q_reg[ATT_WIDTH][8][4];
+    // Register tiles
+    bf16_2 q_reg[8][4];
     bf16_2 k_reg[2][8][4];
     bf16_2 k_reg_t[8][2][4];
     bf16_2 v_reg[4][4][4];
-    float2 o_reg[4][ATT_WIDTH][8];
-    float2 att_block[2][2][ATT_WIDTH][8]; // [double-buf idx][height][width][packed]
-    bf16_2 att_block_bf16[2][ATT_WIDTH][8];
-    bf16_2 att_block_bf16_in[ATT_WIDTH][4][4];
-    float max_vec[ATT_WIDTH], norm_vec[ATT_WIDTH], max_vec_prev[ATT_WIDTH], scale_vec[ATT_WIDTH];
+    float2 o_reg[4][8];
+    float2 att_block[2][2][8]; // [double-buf idx][height][packed]
+    bf16_2 att_block_bf16[2][8];
+    bf16_2 att_block_bf16_in[4][4];
+    float max_vec, norm_vec, max_vec_prev, scale_vec;
 
     zero_o(o_reg);
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) {
-        norm_vec[w] = 0.0f;
-        scale_vec[w] = 0.0f;
-    }
-    int pending_scale = 0;
+    norm_vec = 0.0f;
+    scale_vec = 0.0f;
 
     // Prefill swizzled offsets
     uint32_t swizzled_offsets_K[2];
@@ -867,39 +770,36 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Load K[0] into shared
     group_load_srsrc<true>(k_smem_0, 0, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3);
+                           ks0, ks1, k_base);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
-    // Load Q into registers, scale, convert to bf16 (one 32-wide tile per width).
+    // Load Q into registers, scale, convert to bf16
+    float2 q_reg_fl[8][4];
+    load_q_global(q_reg_fl, g.Q, g.Q_stride1, batch_idx, tile_idx, head_idx);
+
+    // Scale Q
     #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) {
-        float2 q_reg_fl[8][4];
-        load_q_global(q_reg_fl, g.Q, g.Q_stride1, batch_idx, tile_idx, head_idx, w);
-
-        // Scale Q
+    for (int j = 0; j < 8; j++)
         #pragma unroll
-        for (int j = 0; j < 8; j++)
-            #pragma unroll
-            for (int l = 0; l < 4; l++) {
-                q_reg_fl[j][l].x *= TEMPERATURE_SCALE;
-                q_reg_fl[j][l].y *= TEMPERATURE_SCALE;
-            }
+        for (int l = 0; l < 4; l++) {
+            q_reg_fl[j][l].x *= TEMPERATURE_SCALE;
+            q_reg_fl[j][l].y *= TEMPERATURE_SCALE;
+        }
 
-        // Convert float -> bf16
+    // Convert float -> bf16
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
         #pragma unroll
-        for (int j = 0; j < 8; j++)
-            #pragma unroll
-            for (int l = 0; l < 4; l++)
-                q_reg[w][j][l] = __float22bfloat162_rn(q_reg_fl[j][l]);
-    }
+        for (int l = 0; l < 4; l++)
+            q_reg[j][l] = __float22bfloat162_rn(q_reg_fl[j][l]);
 
     // Load K[1] into shared, V[0] into shared
     group_load_srsrc<true>(k_smem_1, 1, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3);
+                           ks0, ks1, k_base);
     group_load_srsrc<false>(v_smem_0, 0, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3);
+                            vs0, vs1, v_base);
 
     // Load K[0] from shared to registers
     load_k_from_shared(k_reg, k_smem_0);
@@ -915,9 +815,9 @@ __global__ void attend_ker(const attn_globals g) {
     mma_AtB_QK(att_block[0], k_reg_t, q_reg, att_block[0]);
 
     // Partial softmax for QK[0]
-    col_max_reset(max_vec, att_block[0]);
-    rv_copy(max_vec_prev, max_vec);
-    rv_exp2(scale_vec);
+    max_vec = col_max_reset(att_block[0]);
+    max_vec_prev = max_vec;
+    scale_vec = exp2f(scale_vec);
 
     sub_col_att(att_block[0], max_vec);
     exp2_base(att_block[0][0]);
@@ -934,9 +834,9 @@ __global__ void attend_ker(const attn_globals g) {
     // Load K[1] from shared, load K[2] into shared, load V[1] into shared
     load_k_from_shared(k_reg, k_smem_1);
     group_load_srsrc<true>(k_smem_0, 2, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3);
+                           ks0, ks1, k_base);
     group_load_srsrc<false>(v_smem_1, 1, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3);
+                            vs0, vs1, v_base);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
     __builtin_amdgcn_sched_barrier(0);
@@ -950,13 +850,11 @@ __global__ void attend_ker(const attn_globals g) {
         // Cluster 0: QK[odd]
         zero_att(att_block[1]);
         transpose_k(k_reg_t, k_reg);
-        if (pending_scale) {
-            rv_mul(norm_vec, scale_vec);
-        }
         mma_AtB_QK(att_block[1], k_reg_t, q_reg, att_block[1]);
         // Finish softmax for QK[even]
         exp2_base(att_block[0][1]);
-        col_sum_accum(norm_vec, att_block[0], norm_vec);
+        norm_vec *= scale_vec;
+        norm_vec = col_sum_accum(att_block[0], norm_vec);
         copy_f32_to_bf16(att_block_bf16, att_block[0]);
         reinterpret_att(att_block_bf16_in, att_block_bf16);
         sched_barrier_exp_pairs<6, 3, 1>();
@@ -967,7 +865,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 1: Load K[j] into shared, load V from shared
         group_load_srsrc<true>(k_smem_1, j, k_row_stride, swizzled_offsets_K,
-                               ks0, ks1, ks2, ks3);
+                               ks0, ks1, k_base);
         load_v_from_shared(v_reg, v_smem_0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -978,24 +876,16 @@ __global__ void attend_ker(const attn_globals g) {
         // Cluster 2: A[even]*V, partial softmax for QK[odd]
         __builtin_amdgcn_s_setprio(1);
         mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
-        col_max_accum(max_vec, att_block[1], max_vec_prev);
-        sched_barrier_pairs<4, 5, 2>();
-        {
-            int all_ok = rv_all_below(max_vec_prev, max_vec, RESCALE_THRESHOLD);
-            if (__builtin_expect(all_ok, 1)) {
-                rv_copy(max_vec, max_vec_prev);
-                pending_scale = 0;
-            } else {
-                rv_diff_exp2(scale_vec, max_vec_prev, max_vec);
-                mul_col_o(o_reg, scale_vec);
-                rv_copy(max_vec_prev, max_vec);
-                pending_scale = 1;
-            }
-        }
+        max_vec = col_max_accum(att_block[1], max_vec_prev);
+        scale_vec = max_vec_prev - max_vec;
+        max_vec_prev = max_vec;
+        scale_vec = exp2f(scale_vec);
         sub_col_att(att_block[1], max_vec);
         exp2_base(att_block[1][0]);
-        sched_barrier_pairs<6, 5, 2>();
+        sched_barrier_pairs<10, 5, 2>();
         sched_barrier_exp_pairs<6, 3, 2>();
+        __builtin_amdgcn_sched_barrier(0);
+        mul_col_o(o_reg, scale_vec);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1003,7 +893,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 3: Load V[j-1] into shared, load K from shared
         group_load_srsrc<false>(v_smem_0, j - 1, v_row_stride, swizzled_offsets_V,
-                                vs0, vs1, vs2, vs3);
+                                vs0, vs1, v_base);
         load_k_from_shared(k_reg, k_smem_0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -1014,13 +904,11 @@ __global__ void attend_ker(const attn_globals g) {
         // Cluster 4: QK[even]
         zero_att(att_block[0]);
         transpose_k(k_reg_t, k_reg);
-        if (pending_scale) {
-            rv_mul(norm_vec, scale_vec);
-        }
         mma_AtB_QK(att_block[0], k_reg_t, q_reg, att_block[0]);
         // Finish softmax for QK[odd]
         exp2_base(att_block[1][1]);
-        col_sum_accum(norm_vec, att_block[1], norm_vec);
+        norm_vec *= scale_vec;
+        norm_vec = col_sum_accum(att_block[1], norm_vec);
         copy_f32_to_bf16(att_block_bf16, att_block[1]);
         reinterpret_att(att_block_bf16_in, att_block_bf16);
         sched_barrier_exp_pairs<6, 3, 3>();
@@ -1031,7 +919,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 5: Load K[j+1] into shared, load V from shared
         group_load_srsrc<true>(k_smem_0, j + 1, k_row_stride, swizzled_offsets_K,
-                               ks0, ks1, ks2, ks3);
+                               ks0, ks1, k_base);
         load_v_from_shared(v_reg, v_smem_1);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -1042,24 +930,16 @@ __global__ void attend_ker(const attn_globals g) {
         // Cluster 6: A[odd]*V, partial softmax for QK[even]
         __builtin_amdgcn_s_setprio(1);
         mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
-        col_max_accum(max_vec, att_block[0], max_vec_prev);
-        sched_barrier_pairs<4, 5, 4>();
-        {
-            int all_ok = rv_all_below(max_vec_prev, max_vec, RESCALE_THRESHOLD);
-            if (__builtin_expect(all_ok, 1)) {
-                rv_copy(max_vec, max_vec_prev);
-                pending_scale = 0;
-            } else {
-                rv_diff_exp2(scale_vec, max_vec_prev, max_vec);
-                mul_col_o(o_reg, scale_vec);
-                rv_copy(max_vec_prev, max_vec);
-                pending_scale = 1;
-            }
-        }
+        max_vec = col_max_accum(att_block[0], max_vec_prev);
+        scale_vec = max_vec_prev - max_vec;
+        max_vec_prev = max_vec;
+        scale_vec = exp2f(scale_vec);
         sub_col_att(att_block[0], max_vec);
         exp2_base(att_block[0][0]);
-        sched_barrier_pairs<6, 5, 4>();
+        sched_barrier_pairs<10, 5, 4>();
         sched_barrier_exp_pairs<6, 3, 4>();
+        __builtin_amdgcn_sched_barrier(0);
+        mul_col_o(o_reg, scale_vec);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1067,7 +947,7 @@ __global__ void attend_ker(const attn_globals g) {
 
         // Cluster 7: Load V[j] into shared, load K from shared
         group_load_srsrc<false>(v_smem_1, j, v_row_stride, swizzled_offsets_V,
-                                vs0, vs1, vs2, vs3);
+                                vs0, vs1, v_base);
         load_k_from_shared(k_reg, k_smem_1);
         asm volatile("s_waitcnt lgkmcnt(0)");
         asm volatile("s_waitcnt vmcnt(4)");
@@ -1086,10 +966,8 @@ __global__ void attend_ker(const attn_globals g) {
     mma_AtB_QK(att_block[1], k_reg_t, q_reg, att_block[1]);
     // Finish softmax for QK[last even]
     exp2_base(att_block[0][1]);
-    if (pending_scale) {
-        rv_mul(norm_vec, scale_vec);
-    }
-    col_sum_accum(norm_vec, att_block[0], norm_vec);
+    norm_vec *= scale_vec;
+    norm_vec = col_sum_accum(att_block[0], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[0]);
     reinterpret_att(att_block_bf16_in, att_block_bf16);
     sched_barrier_exp_pairs<6, 3, 5>();
@@ -1100,7 +978,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 1: Load K[num_tiles-1] into shared, load V from shared
     group_load_srsrc<true>(k_smem_1, num_tiles - 1, k_row_stride, swizzled_offsets_K,
-                           ks0, ks1, ks2, ks3);
+                           ks0, ks1, k_base);
     load_v_from_shared(v_reg, v_smem_0);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
@@ -1111,9 +989,10 @@ __global__ void attend_ker(const attn_globals g) {
     // Cluster 2: A*V, partial softmax
     __builtin_amdgcn_s_setprio(1);
     mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
-    col_max_accum(max_vec, att_block[1], max_vec_prev);
-    rv_diff_exp2(scale_vec, max_vec_prev, max_vec);
-    rv_copy(max_vec_prev, max_vec);
+    max_vec = col_max_accum(att_block[1], max_vec_prev);
+    scale_vec = max_vec_prev - max_vec;
+    max_vec_prev = max_vec;
+    scale_vec = exp2f(scale_vec);
     sub_col_att(att_block[1], max_vec);
     exp2_base(att_block[1][0]);
     sched_barrier_pairs<10, 5, 6>();
@@ -1127,7 +1006,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 3: Load V[num_tiles-2] into shared, load K from shared
     group_load_srsrc<false>(v_smem_0, num_tiles - 2, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3);
+                            vs0, vs1, v_base);
     load_k_from_shared(k_reg, k_smem_0);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(4)");
@@ -1141,8 +1020,8 @@ __global__ void attend_ker(const attn_globals g) {
     mma_AtB_QK(att_block[0], k_reg_t, q_reg, att_block[0]);
     // Finish softmax
     exp2_base(att_block[1][1]);
-    rv_mul(norm_vec, scale_vec);
-    col_sum_accum(norm_vec, att_block[1], norm_vec);
+    norm_vec *= scale_vec;
+    norm_vec = col_sum_accum(att_block[1], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[1]);
     reinterpret_att(att_block_bf16_in, att_block_bf16);
     sched_barrier_exp_pairs<6, 3, 7>();
@@ -1162,9 +1041,10 @@ __global__ void attend_ker(const attn_globals g) {
     // Cluster 6: A*V, partial softmax
     __builtin_amdgcn_s_setprio(1);
     mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
-    col_max_accum(max_vec, att_block[0], max_vec_prev);
-    rv_diff_exp2(scale_vec, max_vec_prev, max_vec);
-    rv_copy(max_vec_prev, max_vec);
+    max_vec = col_max_accum(att_block[0], max_vec_prev);
+    scale_vec = max_vec_prev - max_vec;
+    max_vec_prev = max_vec;
+    scale_vec = exp2f(scale_vec);
     sub_col_att(att_block[0], max_vec);
     exp2_base(att_block[0][0]);
     sched_barrier_pairs<10, 5, 8>();
@@ -1177,7 +1057,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 7: Load V[num_tiles-1] into shared, load K from shared
     group_load_srsrc<false>(v_smem_1, num_tiles - 1, v_row_stride, swizzled_offsets_V,
-                            vs0, vs1, vs2, vs3);
+                            vs0, vs1, v_base);
     load_k_from_shared(k_reg, k_smem_1);
     asm volatile("s_waitcnt lgkmcnt(0)");
     asm volatile("s_waitcnt vmcnt(2)");
@@ -1191,8 +1071,8 @@ __global__ void attend_ker(const attn_globals g) {
     mma_AtB_QK(att_block[1], k_reg_t, q_reg, att_block[1]);
     // Finish softmax
     exp2_base(att_block[0][1]);
-    rv_mul(norm_vec, scale_vec);
-    col_sum_accum(norm_vec, att_block[0], norm_vec);
+    norm_vec *= scale_vec;
+    norm_vec = col_sum_accum(att_block[0], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[0]);
     reinterpret_att(att_block_bf16_in, att_block_bf16);
     sched_barrier_exp_pairs<6, 3, 9>();
@@ -1211,9 +1091,10 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Cluster 10: A*V, full softmax for last QK
     mma_AtB_OV(o_reg, v_reg, att_block_bf16_in, o_reg);
-    col_max_accum(max_vec, att_block[1], max_vec_prev);
-    rv_diff_exp2(scale_vec, max_vec_prev, max_vec);
-    rv_copy(max_vec_prev, max_vec);
+    max_vec = col_max_accum(att_block[1], max_vec_prev);
+    scale_vec = max_vec_prev - max_vec;
+    max_vec_prev = max_vec;
+    scale_vec = exp2f(scale_vec);
     sub_col_att(att_block[1], max_vec);
     exp2_base(att_block[1][0]);
     sched_barrier_pairs<10, 5, 10>();
@@ -1221,8 +1102,8 @@ __global__ void attend_ker(const attn_globals g) {
     __builtin_amdgcn_sched_barrier(0);
 
     exp2_base(att_block[1][1]);
-    rv_mul(norm_vec, scale_vec);
-    col_sum_accum(norm_vec, att_block[1], norm_vec);
+    norm_vec *= scale_vec;
+    norm_vec = col_sum_accum(att_block[1], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[1]);
     reinterpret_att(att_block_bf16_in, att_block_bf16);
     __builtin_amdgcn_sched_barrier(0);
@@ -1252,13 +1133,10 @@ __global__ void attend_ker(const attn_globals g) {
     // Store O
     store_o_global(g.O, o_reg, g.O_stride1, batch_idx, tile_idx, head_idx);
 
-    // Compute and store LSE (one per query column-tile)
-    #pragma unroll
-    for (int w = 0; w < ATT_WIDTH; w++) {
-        float lse_max = max_vec[w] * 0.69314718056f;
-        float lse = logf(norm_vec[w]) + lse_max;
-        store_lse_global(g.L, lse, g.L_dim3, batch_idx, head_idx, tile_idx, w);
-    }
+    // Compute and store LSE
+    float lse_max = max_vec * 0.69314718056f;
+    float lse = logf(norm_vec) + lse_max;
+    store_lse_global(g.L, lse, g.L_dim3, batch_idx, head_idx, tile_idx);
 }
 
 // ============================================================================
