@@ -8,6 +8,9 @@ import os
 from torch.nn.functional import scaled_dot_product_attention
 import aiter
 import hip_tk_kernel
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from kernel import build_gqa_attn
 
 torch.manual_seed(0)
 random.seed(0)
@@ -200,3 +203,68 @@ l_diff_tk, l_err_cnt_tk, l_total_tk, l_rel_error_tk, l_l2_error_tk, l_cos_tk, l_
 print(f"LSE: max_abs={l_diff_tk.max().item():.6f}, max_rel={l_rel_error_tk:.4f}, "
     f"rel_l2={l_l2_error_tk:.4f}, cos={l_cos_tk:.6f}, "
     f"errors={l_err_cnt_tk}/{l_total_tk} ({100*l_err_cnt_tk/l_total_tk:.4f}%)")
+
+
+print("\n\nFlyDSL kernel:")
+fly_launch = build_gqa_attn(ATTN_B=B, ATTN_H=H, ATTN_H_KV=H_KV, ATTN_N=N, ATTN_D=D)
+fly_stream = torch.cuda.current_stream()
+
+
+def _fly_args(q_, k_, v_, o_, l_):
+    return (q_.reshape(-1), k_.reshape(-1), v_.reshape(-1), o_.reshape(-1), l_.reshape(-1),
+            H * D, H_KV * D, H_KV * D, H * D, N, fx.Stream(fly_stream))
+
+
+out_fly = torch.zeros(B, N, H, D, dtype=dtype, device='cuda')
+lse_fly = torch.zeros(B, H, 1, N, dtype=torch.float32, device='cuda')
+q = torch.randn(B, N, H, D, dtype=dtype, device='cuda', requires_grad=True)
+k = torch.randn(B, N, H_KV, D, dtype=dtype, device='cuda', requires_grad=True)
+v = torch.randn(B, N, H_KV, D, dtype=dtype, device='cuda', requires_grad=True)
+fly_compiled = flyc.compile(fly_launch, *_fly_args(q, k, v, out_fly, lse_fly))
+
+for _ in range(num_warmup):
+    out_fly = torch.zeros(B, N, H, D, dtype=dtype, device='cuda', requires_grad=True)
+    lse_fly = torch.zeros(B, H, 1, N, dtype=torch.float32, device='cuda', requires_grad=True)
+    q = torch.randn(B, N, H, D, dtype=dtype, device='cuda', requires_grad=True)
+    k = torch.randn(B, N, H_KV, D, dtype=dtype, device='cuda', requires_grad=True)
+    v = torch.randn(B, N, H_KV, D, dtype=dtype, device='cuda', requires_grad=True)
+    fly_compiled(*_fly_args(q, k, v, out_fly, lse_fly))
+timings_fly = []
+out_fly = torch.zeros(B, N, H, D, dtype=dtype, device='cuda', requires_grad=True)
+lse_fly = torch.zeros(B, H, 1, N, dtype=torch.float32, device='cuda', requires_grad=True)
+torch.manual_seed(0)
+random.seed(0)
+for _ in range(num_iters):
+    q = torch.randn(B, N, H, D, dtype=dtype, device='cuda', requires_grad=True)
+    k = torch.randn(B, N, H_KV, D, dtype=dtype, device='cuda', requires_grad=True)
+    v = torch.randn(B, N, H_KV, D, dtype=dtype, device='cuda', requires_grad=True)
+    torch.cuda.synchronize()
+    start_event.record()
+    fly_compiled(*_fly_args(q, k, v, out_fly, lse_fly))
+    end_event.record()
+    torch.cuda.synchronize()
+    timings_fly.append(start_event.elapsed_time(end_event))
+print(f"{out_fly.dtype=}")
+avg_time_fly = sum(timings_fly) / len(timings_fly)
+eff_fly = efficiency(flops_ref, avg_time_fly)
+print(f"Average execution time: {avg_time_fly:.4f} ms")
+print(f"Performance: {eff_fly:.2f} TFLOPS for {B=} {H=} {N=} {D=} {causal=} attention.\n")
+
+print(f"\n FlyDSL vs AITER comparison:")
+print("\nO outputs:")
+print("FLY: ", out_fly[0, 0, :num_print, 0], "Max:", out_fly.max().item())
+print("AITER: ", out_ref[0, 0, :num_print, 0], "Max:", out_ref.max().item())
+print("Robustness check:")
+o_diff_f, o_err_cnt_f, o_total_f, o_rel_error_f, o_l2_error_f, o_cos_f, o_mask_f = robustness_check(out_fly, out_ref)
+print(f"O: max_abs={o_diff_f.max().item():.6f}, max_rel={o_rel_error_f:.4f}, "
+    f"rel_l2={o_l2_error_f:.4f}, cos={o_cos_f:.6f}, "
+    f"errors={o_err_cnt_f}/{o_total_f} ({100*o_err_cnt_f/o_total_f:.4f}%)")
+l_diff_f, l_err_cnt_f, l_total_f, l_rel_error_f, l_l2_error_f, l_cos_f, l_mask_f = robustness_check(lse_fly, lse_ref.unsqueeze(-1).transpose(-1, -2))
+print(f"LSE: max_abs={l_diff_f.max().item():.6f}, max_rel={l_rel_error_f:.4f}, "
+    f"rel_l2={l_l2_error_f:.4f}, cos={l_cos_f:.6f}, "
+    f"errors={l_err_cnt_f}/{l_total_f} ({100*l_err_cnt_f/l_total_f:.4f}%)")
+
+print(f"\n FlyDSL vs Plain HIP comparison:")
+o_diff_fh, o_err_cnt_fh, o_total_fh, o_rel_error_fh, o_l2_error_fh, o_cos_fh, o_mask_fh = robustness_check(out_fly, out_hip)
+print(f"O: max_abs={o_diff_fh.max().item():.6f}, cos={o_cos_fh:.6f}, "
+    f"errors={o_err_cnt_fh}/{o_total_fh} ({100*o_err_cnt_fh/o_total_fh:.4f}%)")
