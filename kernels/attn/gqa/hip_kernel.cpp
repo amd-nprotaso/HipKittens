@@ -177,16 +177,15 @@ __device__ __forceinline__ void sched_barrier_exp_pairs() {
 __device__ __forceinline__ void mma_AtB_QK(
     float2 (&D)[2][8],
     const bf16_2 (&A)[8][2][4],
-    const bf16 (&B)[8][8],
+    const bf16_2 (&B)[8][1][4],
     const float2 (&C)[2][8])
 {
-    const bf16_2 (&Bp)[8][4] = reinterpret_cast<const bf16_2 (&)[8][4]>(B);
     #pragma unroll
     for (int n = 0; n < 2; n++) {
-        mfma_f32_32x32x16_bf16(D[n], A[0][n], Bp[0], C[n]);
+        mfma_f32_32x32x16_bf16(D[n], A[0][n], B[0][0], C[n]);
         #pragma unroll
         for (int k = 1; k < 8; k++) {
-            mfma_f32_32x32x16_bf16(D[n], A[k][n], Bp[k], D[n]);
+            mfma_f32_32x32x16_bf16(D[n], A[k][n], B[k][0], D[n]);
         }
     }
 }
@@ -233,6 +232,21 @@ __device__ __forceinline__ void transpose_k(
 {
     #pragma unroll
     for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            #pragma unroll
+            for (int k = 0; k < 4; k++)
+                __builtin_memcpy(&dst[j][i][k], &src[i][j][k], sizeof(bf16_2));
+}
+
+// ============================================================================
+// Transpose: q_reg[1][8][4] -> q_reg_t[8][1][4]
+// ============================================================================
+__device__ __forceinline__ void transpose_q(
+    bf16_2 (&dst)[8][1][4], const bf16_2 (&src)[1][8][4])
+{
+    #pragma unroll
+    for (int i = 0; i < 1; i++)
         #pragma unroll
         for (int j = 0; j < 8; j++)
             #pragma unroll
@@ -304,7 +318,7 @@ __device__ __forceinline__ float col_max_accum(const float2 (&data)[2][8], float
 }
 
 // col_sum: reduce float2[2][8] to scalar, accumulate onto prev
-__device__ __forceinline__ float col_sum_accum(const float2 (&data)[2][8], float prev) {
+__device__ __forceinline__ void col_sum_accum(const float2 (&data)[2][8], float& prev) {
     float sm = 0.0f;
     #pragma unroll
     for (int i = 0; i < 2; i++)
@@ -316,7 +330,8 @@ __device__ __forceinline__ float col_sum_accum(const float2 (&data)[2][8], float
     uint2_t res = __builtin_amdgcn_permlane32_swap(
         __float_as_uint(sm), __float_as_uint(sm), false, true);
     sm = __uint_as_float(res.x) + __uint_as_float(res.y);
-    return prev + sm;
+    
+    prev = prev + sm;
 }
 
 // sub_col: data[i][k] -= val (broadcast scalar to float2)
@@ -816,6 +831,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     // Register tiles
     bf16 q_reg[1][8][8];
+    bf16_2 q_reg_t[8][1][4];
     bf16_2 k_reg[2][8][4];
     bf16_2 k_reg_t[8][2][4];
     bf16_2 v_reg[4][4][4];
@@ -855,6 +871,9 @@ __global__ void attend_ker(const attn_globals g) {
     // Convert float -> bf16
     convert_q_to_bf16(q_reg[0], q_reg_fl);
 
+    // Transpose Q (row_l -> col_l), matching the reference's q_reg_transposed
+    transpose_q(q_reg_t, reinterpret_cast<const bf16_2(&)[1][8][4]>(q_reg));
+
     // Load K[1] into shared, V[0] into shared
     group_load_srsrc<true>(1, k_row_stride, swizzled_offsets_K,
                            k_srsrc_base, k_base, k_lds_base_1);
@@ -872,7 +891,7 @@ __global__ void attend_ker(const attn_globals g) {
     // QK[0]
     zero_att(att_block[0]);
     transpose_k(k_reg_t, k_reg);
-    mma_AtB_QK(att_block[0], k_reg_t, q_reg[0], att_block[0]);
+    mma_AtB_QK(att_block[0], k_reg_t, q_reg_t, att_block[0]);
 
     // Partial softmax for QK[0]
     max_vec = col_max_reset(att_block[0]);
@@ -913,11 +932,11 @@ __global__ void attend_ker(const attn_globals g) {
         if (pending_scale) {
             norm_vec *= scale_vec;
         }
-        mma_AtB_QK(att_block[1], k_reg_t, q_reg[0], att_block[1]);
+        mma_AtB_QK(att_block[1], k_reg_t, q_reg_t, att_block[1]);
         copy_f32_to_bf16_half(att_block_bf16[0], att_block[0][0]);
         // Finish softmax for QK[even]
         exp2_base(att_block[0][1]);
-        norm_vec = col_sum_accum(att_block[0], norm_vec);
+        col_sum_accum(att_block[0], norm_vec);
         copy_f32_to_bf16_half(att_block_bf16[1], att_block[0][1]);
         sched_barrier_exp_pairs<6, 3, 1>();
         sched_barrier_pairs<10, 5, 1>();
@@ -982,10 +1001,10 @@ __global__ void attend_ker(const attn_globals g) {
         if (pending_scale) {
             norm_vec *= scale_vec;
         }
-        mma_AtB_QK(att_block[0], k_reg_t, q_reg[0], att_block[0]);
+        mma_AtB_QK(att_block[0], k_reg_t, q_reg_t, att_block[0]);
         // Finish softmax for QK[odd]
         exp2_base(att_block[1][1]);
-        norm_vec = col_sum_accum(att_block[1], norm_vec);
+        col_sum_accum(att_block[1], norm_vec);
         copy_f32_to_bf16(att_block_bf16, att_block[1]);
         sched_barrier_exp_pairs<6, 3, 3>();
         sched_barrier_pairs<10, 5, 3>();
@@ -1052,11 +1071,11 @@ __global__ void attend_ker(const attn_globals g) {
     // Cluster 0: QK[last odd]
     zero_att(att_block[1]);
     transpose_k(k_reg_t, k_reg);
-    mma_AtB_QK(att_block[1], k_reg_t, q_reg[0], att_block[1]);
+    mma_AtB_QK(att_block[1], k_reg_t, q_reg_t, att_block[1]);
     // Finish softmax for QK[last even]
     exp2_base(att_block[0][1]);
     norm_vec *= scale_vec;
-    norm_vec = col_sum_accum(att_block[0], norm_vec);
+    col_sum_accum(att_block[0], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[0]);
     sched_barrier_exp_pairs<6, 3, 5>();
     sched_barrier_pairs<10, 5, 5>();
@@ -1105,11 +1124,11 @@ __global__ void attend_ker(const attn_globals g) {
     // Cluster 4: QK
     zero_att(att_block[0]);
     transpose_k(k_reg_t, k_reg);
-    mma_AtB_QK(att_block[0], k_reg_t, q_reg[0], att_block[0]);
+    mma_AtB_QK(att_block[0], k_reg_t, q_reg_t, att_block[0]);
     // Finish softmax
     exp2_base(att_block[1][1]);
     norm_vec *= scale_vec;
-    norm_vec = col_sum_accum(att_block[1], norm_vec);
+    col_sum_accum(att_block[1], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[1]);
     sched_barrier_exp_pairs<6, 3, 7>();
     sched_barrier_pairs<10, 5, 7>();
@@ -1155,11 +1174,11 @@ __global__ void attend_ker(const attn_globals g) {
     // Cluster 8: QK
     zero_att(att_block[1]);
     transpose_k(k_reg_t, k_reg);
-    mma_AtB_QK(att_block[1], k_reg_t, q_reg[0], att_block[1]);
+    mma_AtB_QK(att_block[1], k_reg_t, q_reg_t, att_block[1]);
     // Finish softmax
     exp2_base(att_block[0][1]);
     norm_vec *= scale_vec;
-    norm_vec = col_sum_accum(att_block[0], norm_vec);
+    col_sum_accum(att_block[0], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[0]);
     sched_barrier_exp_pairs<6, 3, 9>();
     sched_barrier_pairs<10, 5, 9>();
@@ -1189,7 +1208,7 @@ __global__ void attend_ker(const attn_globals g) {
 
     exp2_base(att_block[1][1]);
     norm_vec *= scale_vec;
-    norm_vec = col_sum_accum(att_block[1], norm_vec);
+    col_sum_accum(att_block[1], norm_vec);
     copy_f32_to_bf16(att_block_bf16, att_block[1]);
     __builtin_amdgcn_sched_barrier(0);
     mul_col_o(o_reg, scale_vec);
