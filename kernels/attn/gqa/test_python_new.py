@@ -10,7 +10,7 @@ import aiter
 import hip_tk_kernel
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from kernel import build_gqa_attn
+from kernel2 import build_gqa_attn
 
 torch.manual_seed(0)
 random.seed(0)

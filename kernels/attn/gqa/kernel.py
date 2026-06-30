@@ -106,40 +106,6 @@ def build_gqa_attn(
                 v16f32_t, [_raw(a_v8), _raw(b_v8), _raw(c_v16)]
             )
 
-        ZERO16 = Vec.filled(16, 0.0, f32).ir_value()
-
-        # ---------------- LDS ----------------
-        lds_alloc = fx.SharedAllocator()
-        k_smem = [
-            lds_alloc.allocate(fx.Array[bf16, KV_BLOCK_SIZE * ATTN_D, 16]).peek().ptr
-            for _ in range_constexpr(2)
-        ]
-        v_smem = [
-            lds_alloc.allocate(fx.Array[bf16, KV_BLOCK_SIZE * ATTN_D, 16]).peek().ptr
-            for _ in range_constexpr(2)
-        ]
-
-        tid = fx.thread_idx.x
-        lid = tid % WARP_SIZE
-        wid = tid // WARP_SIZE
-
-        bx = fx.block_idx.x
-        head_idx = (bx % ATTN_H_KV) * GROUP_SIZE + (bx // ATTN_H_KV)
-        batch_idx = fx.block_idx.z
-        head_idx_kv = head_idx // GROUP_SIZE
-        block_tile_idx = fx.block_idx.y
-        tile_idx = i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(block_tile_idx * NUM_WARPS + wid))))
-        stagger = wid // 4
-
-        Q_rsrc = buffer_ops.create_buffer_resource(Q)
-        K_rsrc = buffer_ops.create_buffer_resource(K)
-        V_rsrc = buffer_ops.create_buffer_resource(V)
-        O_rsrc = buffer_ops.create_buffer_resource(O)
-        L_rsrc = buffer_ops.create_buffer_resource(L)
-
-        k_base_elems = batch_idx * (ATTN_N * ATTN_H_KV * ATTN_D) + head_idx_kv * ATTN_D
-        v_base_elems = batch_idx * (ATTN_N * ATTN_H_KV * ATTN_D) + head_idx_kv * ATTN_D
-
         # ---------------- prefill offsets ----------------
         def prefill_offsets(is_k, row_stride):
             ST_ROWS = 32 if is_k else 8
@@ -174,14 +140,14 @@ def build_gqa_attn(
                 offs.append((global_row * row_stride + global_col) * 2)
             return offs
 
-        off_K = prefill_offsets(True, K_stride1)
-        off_V = prefill_offsets(False, V_stride1)
-
         # ---------------- group_load: global -> LDS ----------------
-        def group_load(smem_ptr, tile, offsets, rsrc, base_elems, row_stride):
+        # lds_base is a wave-uniform SGPR byte address (per-warp LDS destination),
+        # hoisted once via readfirstlane in the setup below — mirrors the reference's
+        # k_lds_base_0/1 and v_lds_base_0/1 so per-buffer LDS addresses don't stay
+        # live in VGPRs across the kernel.
+        def group_load(lds_base, tile, offsets, rsrc, base_elems, row_stride):
             soff_bytes = (base_elems + tile * (KV_BLOCK_SIZE * row_stride)) * 2
             soff_bytes = i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(i32(soff_bytes)))))
-            lds_base = i32(fx.ptrtoint(smem_ptr)) + i32(wid * BYTES_PER_WARP)
             for i in range_constexpr(2):
                 lds_ptr = buffer_ops.create_llvm_ptr(
                     lds_base + i32(i * BYTES_PER_MEMCPY), address_space=3
@@ -192,10 +158,10 @@ def build_gqa_attn(
                 )
 
         def load_k(tile, buf):
-            group_load(k_smem[buf], tile, off_K, K_rsrc, k_base_elems, K_stride1)
+            group_load(k_lds_base[buf], tile, off_K, k_rsrc[buf], k_base_elems, K_stride1)
 
         def load_v(tile, buf):
-            group_load(v_smem[buf], tile, off_V, V_rsrc, v_base_elems, V_stride1)
+            group_load(v_lds_base[buf], tile, off_V, v_rsrc[buf], v_base_elems, V_stride1)
 
         # ---------------- LDS -> registers ----------------
         def _read_v8bf16(smem_ptr, byte_off):
@@ -275,6 +241,7 @@ def build_gqa_attn(
                 + tile_idx * (Q_BLOCK_SIZE * ATTN_H * ATTN_D)
                 + head_idx * ATTN_D
             )
+            O_rsrc = buffer_ops.create_buffer_resource(O)
             for j in range_constexpr(4):
                 ov = Vec(o_reg[j])
                 for k in range_constexpr(4):
@@ -289,6 +256,7 @@ def build_gqa_attn(
         def store_lse(lse_val):
             row_offset = lid % 32
             if lid < 32:
+                L_rsrc = buffer_ops.create_buffer_resource(L)
                 seq_pos = tile_idx * Q_BLOCK_SIZE + row_offset
                 off = batch_idx * (ATTN_H * L_dim3) + head_idx * L_dim3 + seq_pos
                 buffer_ops.buffer_store(f32(lse_val), L_rsrc, _raw(i32(off)))
@@ -348,6 +316,144 @@ def build_gqa_attn(
             b = bcast16(scal)
             return [arith.mulf(_raw(o_reg[n]), _raw(b), fastmath=fm) for n in range_constexpr(4)]
 
+        # ---- finer-grained softmax pieces (match reference cluster splitting) ----
+        def col_sum_into(att, norm):
+            return fadd(norm, col_sum(att))
+
+        def sub_col(att, mx):
+            b = bcast16(mx)
+            return [arith.subf(_raw(att[n]), _raw(b), fastmath=fm) for n in range_constexpr(2)]
+
+        def exp2_one(v16):
+            return Vec(v16).exp2().ir_value()
+
+        # ---- scheduling helpers (mirror reference sched_barrier templates) ----
+        def sb0():
+            rocdl.sched_barrier(0)
+
+        def bar():
+            rocdl.s_barrier()
+
+        def sched_pairs(pairs, valu_cnt, group):
+            for _p in range_constexpr(pairs):
+                rocdl.sched_group_barrier(MFMA_MASK, 1, group)
+                rocdl.sched_group_barrier(VALU_MASK, valu_cnt, group)
+
+        def sched_exp_pairs(pairs, exp_cnt, group):
+            for _p in range_constexpr(pairs):
+                rocdl.sched_group_barrier(MFMA_MASK, 1, group)
+                rocdl.sched_group_barrier(EXP_MASK, exp_cnt, group)
+
+        def wait_vmcnt(n):
+            _llvm.inline_asm(None, [], f"s_waitcnt vmcnt({n})", "", has_side_effects=True)
+
+        def wait_lgkmcnt0():
+            _llvm.inline_asm(None, [], "s_waitcnt lgkmcnt(0)", "", has_side_effects=True)
+
+        # ---- lazy-threshold rescale (reference lane_below + __all vote) ----
+        # Returns (corr_vec16, corr_scalar, kept_max). corr == 1.0 when every lane is
+        # within RESCALE_THRESHOLD of the running max (skip rescale); else exp2(prev-new).
+        def lazy_rescale(att, max_prev):
+            m_cur = col_max(att)
+            m_new = fmaxf(m_cur, max_prev)
+            delta = arith.subf(_raw(m_new), _raw(max_prev), fastmath=fm)
+            not_ok = arith.cmpf(arith.CmpFPredicate.OGT, _raw(delta), _raw(f32(RESCALE_THRESHOLD)))
+            mask = rocdl.ballot(T.i64, not_ok)
+            all_ok = arith.cmpi(arith.CmpIPredicate.eq, _raw(mask), _raw(fx.Int64(0)))
+            kept_max = arith.select(all_ok, _raw(max_prev), _raw(m_new))
+            scale = arith.subf(_raw(max_prev), _raw(m_new), fastmath=fm)
+            scale_exp = Vec(bcast16(scale)).exp2().ir_value()
+            corr_s = arith.select(all_ok, _raw(f32(1.0)), _raw(Vec(scale_exp)[0]))
+            corr_v = bcast16(corr_s)
+            return corr_v, fx.Float32(corr_s), fx.Float32(kept_max)
+
+        # =====================================================================
+        # stage_qk: QK[tile] + start of softmax (max update + sub both heights +
+        #   exp2 of height 0). Returns the partially-softmaxed att ([att_h0_exp,
+        #   att_h1_subbed]), the kept max, and rescaled (o_reg, norm). The o_reg /
+        #   norm rescale here corresponds to the reference's lazy-threshold vote;
+        #   it must be emitted AFTER the previous tile's OV has accumulated.
+        # =====================================================================
+        def stage_qk(kreg, max_prev, o_reg, norm_vec, first):
+            att = qk(kreg, qpacks)                       # [2] v16f32
+            if const_expr(first):
+                max_new = fx.Float32(col_max(att))       # reference col_max_reset
+                corr_applied_o = o_reg
+                corr_applied_n = norm_vec
+            else:
+                corr_v, corr_s, max_new = lazy_rescale(att, max_prev)
+                corr_applied_o = [
+                    arith.mulf(_raw(o_reg[n]), _raw(corr_v), fastmath=fm) for n in range_constexpr(4)
+                ]
+                corr_applied_n = fmul(norm_vec, corr_s)
+            sub = sub_col(att, max_new)                  # [2] v16f32 (both heights)
+            sub[0] = exp2_one(sub[0])                    # finish height 0 only
+            return sub, max_new, corr_applied_o, corr_applied_n
+
+        # stage_finish: exp2 height 1, accumulate col_sum into norm, OV with vreg.
+        def stage_finish(att_partial, vreg, o_reg, norm_vec):
+            att = [att_partial[0], exp2_one(att_partial[1])]
+            norm_vec = col_sum_into(att, norm_vec)
+            p_bf = to_bf16_packs(att)                    # [4] v8bf16
+            for kk in range_constexpr(4):
+                o_reg = ov_slice(o_reg, [vreg[kk][n] for n in range_constexpr(4)], p_bf[kk])
+            return o_reg, norm_vec
+
+        # =====================================================================
+        # Imperative setup (all helpers above; executable code below)
+        # =====================================================================
+        ZERO16 = Vec.filled(16, 0.0, f32).ir_value()
+
+        # ---------------- LDS ----------------
+        # Matches hip_kernel.cpp: contiguous k_smem_0, k_smem_1, v_smem_0, v_smem_1.
+        lds_alloc = fx.SharedAllocator()
+        k_smem_0 = lds_alloc.allocate(fx.Array[bf16, KV_BLOCK_SIZE * ATTN_D, 16]).peek().ptr
+        k_smem_1 = lds_alloc.allocate(fx.Array[bf16, KV_BLOCK_SIZE * ATTN_D, 16]).peek().ptr
+        v_smem_0 = lds_alloc.allocate(fx.Array[bf16, KV_BLOCK_SIZE * ATTN_D, 16]).peek().ptr
+        v_smem_1 = lds_alloc.allocate(fx.Array[bf16, KV_BLOCK_SIZE * ATTN_D, 16]).peek().ptr
+        k_smem = [k_smem_0, k_smem_1]
+        v_smem = [v_smem_0, v_smem_1]
+
+        tid = fx.thread_idx.x
+        lid = tid % WARP_SIZE
+        wid = tid // WARP_SIZE
+
+        # Per-warp LDS destination bases, hoisted into SGPRs (wave-uniform) so the
+        # global->LDS loads don't keep per-buffer VGPR addresses live across the
+        # kernel. Mirrors hip_kernel.cpp's k_lds_base_0/1, v_lds_base_0/1.
+        lds_warp_off = wid * BYTES_PER_WARP
+        def _lds_base(smem_ptr):
+            byte_addr = i32(fx.ptrtoint(smem_ptr)) + i32(lds_warp_off)
+            return i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(byte_addr))))
+        k_lds_base_0 = _lds_base(k_smem_0)
+        k_lds_base_1 = _lds_base(k_smem_1)
+        v_lds_base_0 = _lds_base(v_smem_0)
+        v_lds_base_1 = _lds_base(v_smem_1)
+        k_lds_base = [k_lds_base_0, k_lds_base_1]
+        v_lds_base = [v_lds_base_0, v_lds_base_1]
+
+        bx = fx.block_idx.x
+        head_idx = (bx % ATTN_H_KV) * GROUP_SIZE + (bx // ATTN_H_KV)
+        batch_idx = fx.block_idx.z
+        head_idx_kv = head_idx // GROUP_SIZE
+        block_tile_idx = fx.block_idx.y
+        tile_idx = i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(block_tile_idx * NUM_WARPS + wid))))
+        stagger = wid // 4
+
+        k_base_elems = batch_idx * (ATTN_N * ATTN_H_KV * ATTN_D) + head_idx_kv * ATTN_D
+        v_base_elems = batch_idx * (ATTN_N * ATTN_H_KV * ATTN_D) + head_idx_kv * ATTN_D
+
+        # Single base descriptor per tensor (mirrors k_srsrc_base / v_srsrc_base in
+        # hip_kernel.cpp); both double-buffer slots share the same resource.
+        k_srsrc_base = buffer_ops.create_buffer_resource(K)
+        v_srsrc_base = buffer_ops.create_buffer_resource(V)
+        Q_rsrc = buffer_ops.create_buffer_resource(Q)
+        k_rsrc = [k_srsrc_base, k_srsrc_base]
+        v_rsrc = [v_srsrc_base, v_srsrc_base]
+
+        off_K = prefill_offsets(True, K_stride1)
+        off_V = prefill_offsets(False, V_stride1)
+
         # =====================================================================
         # Main compute (double-buffered software pipeline over KV tiles)
         #   prologue:  load tile 0 into buf 0
@@ -360,52 +466,116 @@ def build_gqa_attn(
 
         qpacks = load_q_packs()
 
-        # prologue: stage tile 0
+        # One pipelined KV tile: QK[t] overlaps finish/OV[t-1]. Identical body to
+        # the original per-tile step; pulled into a helper so the hot loop can be a
+        # runtime scf.for (step 2) with compile-time-constant double-buffer parities
+        # (cur/nxt), which keeps register pressure bounded instead of fully
+        # unrolling all KV tiles (the latter spills ~600 VGPRs to scratch).
+        def tile_step(cur, nxt, prefetch_tile, has_next, att_held, o_reg,
+                      vreg_held, max_vec, norm_vec, wait_n):
+            kreg = load_k_regs(cur)
+
+            # QK[t] (frontier) overlaps with finishing tile t-1
+            rocdl.s_setprio(1)
+            att_next = qk(kreg, qpacks)
+
+            # finish tile t-1: exp height1, col_sum, OV
+            o_reg, norm_vec = stage_finish(att_held, vreg_held, o_reg, norm_vec)
+
+            # softmax start for tile t (rescale must follow tile t-1's OV)
+            corr_v, corr_s, max_vec = lazy_rescale(att_next, max_vec)
+            norm_vec = fmul(norm_vec, corr_s)
+            o_reg = [arith.mulf(_raw(o_reg[n]), _raw(corr_v), fastmath=fm) for n in range_constexpr(4)]
+            sub = sub_col(att_next, max_vec)
+            sub[0] = exp2_one(sub[0])
+            sched_exp_pairs(6, 3, 1)
+            sched_pairs(10, 5, 1)
+            rocdl.s_setprio(0)
+            sb0()
+            bar()
+            sb0()
+
+            # prefetch tile t+1 into the alternate buffer, then load tile t's V regs
+            if const_expr(has_next):
+                load_k(prefetch_tile, nxt)
+                load_v(prefetch_tile, nxt)
+            vreg_new = load_v_regs(cur)
+            wait_lgkmcnt0()
+            wait_vmcnt(wait_n)
+            sb0()
+            bar()
+            sb0()
+            return sub, o_reg, vreg_new, max_vec, norm_vec
+
+        # ---- prologue: stage K[0]/V[0] into buf0, K[1]/V[1] into buf1 ----
         load_k(0, 0)
         load_v(0, 0)
         rocdl.s_waitcnt(0)
         rocdl.s_barrier()
 
-        for t in range_constexpr(NUM_KV_TILES):
-            cur = t % 2
-            has_next = const_expr(t + 1 < NUM_KV_TILES)
-            nxt = (t + 1) % 2
+        kreg = load_k_regs(0)
+        if const_expr(NUM_KV_TILES > 1):
+            load_k(1, 1)
+            load_v(1, 1)
+        rocdl.s_setprio(1)
+        att_held, max_vec, o_reg, norm_vec = stage_qk(kreg, max_vec, o_reg, norm_vec, True)
+        rocdl.s_setprio(0)
+        sb0()
+        bar()
+        sb0()
+        vreg_held = load_v_regs(0)
+        wait_lgkmcnt0()
+        wait_vmcnt(2)
+        sb0()
+        bar()
+        sb0()
 
-            kreg = load_k_regs(cur)
-            vreg = load_v_regs(cur)
+        # ---- flatten loop-carried state into scalar iter_args (scf.for requires
+        #      each carried value to be a single MLIR value, not a Python list) ----
+        ah0, ah1 = att_held[0], att_held[1]
+        o0, o1, o2, o3 = o_reg[0], o_reg[1], o_reg[2], o_reg[3]
+        vh0, vh1, vh2, vh3 = vreg_held[0][0], vreg_held[0][1], vreg_held[0][2], vreg_held[0][3]
+        vh4, vh5, vh6, vh7 = vreg_held[1][0], vreg_held[1][1], vreg_held[1][2], vreg_held[1][3]
+        vh8, vh9, vh10, vh11 = vreg_held[2][0], vreg_held[2][1], vreg_held[2][2], vreg_held[2][3]
+        vh12, vh13, vh14, vh15 = vreg_held[3][0], vreg_held[3][1], vreg_held[3][2], vreg_held[3][3]
 
-            # prefetch next tile into the alternate buffer (async global->LDS)
-            if has_next:
-                load_k(t + 1, nxt)
-                load_v(t + 1, nxt)
+        # ---- hot loop: runtime scf.for over tile pairs. jj is always odd so the
+        #      two tiles per body have fixed parities (cur=1 then cur=0). Covers
+        #      tiles 1..NUM_KV_TILES-2; the last tile is handled below. ----
+        # Only flat scalar/vector names (ah*, o*, vh*, max_vec, norm_vec) are
+        # loop-carried; the reconstructed Python lists below use fresh names so the
+        # auto-iter_arg collector doesn't try to carry a list (which scf.for rejects).
+        for jj in range(1, NUM_KV_TILES - 2, 2):
+            jt = i32(jj)
+            _ah = [ah0, ah1]
+            _o = [o0, o1, o2, o3]
+            _vh = [[vh0, vh1, vh2, vh3], [vh4, vh5, vh6, vh7],
+                   [vh8, vh9, vh10, vh11], [vh12, vh13, vh14, vh15]]
 
-            rocdl.s_setprio(1)
-            att = qk(kreg, qpacks)            # [2] v16f32
+            # tile t = jj (parity 1, prefetch jj+1 into buf 0)
+            _ah, _o, _vh, max_vec, norm_vec = tile_step(
+                1, 0, jt + 1, True, _ah, _o, _vh, max_vec, norm_vec, 4)
+            # tile t = jj+1 (parity 0, prefetch jj+2 into buf 1)
+            _ah, _o, _vh, max_vec, norm_vec = tile_step(
+                0, 1, jt + 2, True, _ah, _o, _vh, max_vec, norm_vec, 4)
 
-            m_cur = col_max(att)
-            m_new = fmaxf(max_vec, m_cur)
+            ah0, ah1 = _ah[0], _ah[1]
+            o0, o1, o2, o3 = _o[0], _o[1], _o[2], _o[3]
+            vh0, vh1, vh2, vh3 = _vh[0][0], _vh[0][1], _vh[0][2], _vh[0][3]
+            vh4, vh5, vh6, vh7 = _vh[1][0], _vh[1][1], _vh[1][2], _vh[1][3]
+            vh8, vh9, vh10, vh11 = _vh[2][0], _vh[2][1], _vh[2][2], _vh[2][3]
+            vh12, vh13, vh14, vh15 = _vh[3][0], _vh[3][1], _vh[3][2], _vh[3][3]
 
-            # rescale running stats
-            corr = Vec(bcast16(arith.subf(_raw(max_vec), _raw(m_new), fastmath=fm))).exp2().ir_value()
-            corr_s = fx.Float32(Vec(corr)[0])
-            norm_vec = fmul(norm_vec, corr_s)
-            o_reg = [arith.mulf(_raw(o_reg[n]), _raw(corr), fastmath=fm) for n in range_constexpr(4)]
+        # ---- leftover final tile t = NUM_KV_TILES-1 (parity 1, no prefetch) ----
+        att_held = [ah0, ah1]
+        o_reg = [o0, o1, o2, o3]
+        vreg_held = [[vh0, vh1, vh2, vh3], [vh4, vh5, vh6, vh7],
+                     [vh8, vh9, vh10, vh11], [vh12, vh13, vh14, vh15]]
+        att_held, o_reg, vreg_held, max_vec, norm_vec = tile_step(
+            1, 0, 0, False, att_held, o_reg, vreg_held, max_vec, norm_vec, 4)
 
-            p = sub_exp2(att, m_new)          # [2] v16f32, exp2(att - m_new)
-            s_cur = col_sum(p)
-            norm_vec = fadd(norm_vec, s_cur)
-
-            p_bf = to_bf16_packs(p)           # [4] v8bf16
-            for kk in range_constexpr(4):
-                o_reg = ov_slice(o_reg, [vreg[kk][n] for n in range_constexpr(4)], p_bf[kk])
-            rocdl.s_setprio(0)
-
-            max_vec = m_new
-
-            # wait for prefetched tile to land + sync all waves before next read
-            if has_next:
-                rocdl.s_waitcnt(0)
-                rocdl.s_barrier()
+        # ---- epilogue: finish the last held tile ----
+        o_reg, norm_vec = stage_finish(att_held, vreg_held, o_reg, norm_vec)
 
         inv = arith.divf(_raw(f32(1.0)), _raw(norm_vec), fastmath=fm)
         o_reg = mul_o(o_reg, inv)
