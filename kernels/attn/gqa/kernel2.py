@@ -391,11 +391,31 @@ def build_gqa_attn(
                 rocdl.sched_group_barrier(MFMA_MASK, 1, group)
                 rocdl.sched_group_barrier(EXP_MASK, exp_cnt, group)
 
+        # s_waitcnt via the ROCDL intrinsic (not inline asm). The AMDGPU
+        # SIInsertWaitcnts backend pass understands rocdl.s_waitcnt and folds it
+        # into its own analysis, so it does NOT re-insert conservative waits on
+        # top (vmcnt(0) full-drains / extra partial lgkmcnt) the way it does for
+        # an opaque inline-asm blob. gfx950 s_waitcnt bitfield encoding, matching
+        # kernels/flash_attn_gfx950.py:
+        #   vmcnt = bits[3:0] | (bits[15:14] << 4); expcnt = bits[6:4];
+        #   lgkmcnt = bits[13:8].
+        _VMCNT_LO_MASK = 0xF
+        _LGKMCNT_EXPCNT_BASE = 0x3F70  # vmcnt=0, expcnt=7(max), lgkmcnt=63(max)
+        _VMCNT_HI_SHIFT = 14
+        _VMCNT_HI_MASK = 0x3
+        _LGKMCNT_0_ONLY = 0xC07F  # vmcnt=63(max), expcnt=7(max), lgkmcnt=0
+
         def wait_vmcnt(n):
-            _llvm.inline_asm(None, [], f"s_waitcnt vmcnt({n})", "", has_side_effects=True)
+            # vmcnt(n) only; leave lgkmcnt/expcnt maxed (no wait on those).
+            val = (
+                (n & _VMCNT_LO_MASK)
+                | _LGKMCNT_EXPCNT_BASE
+                | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
+            )
+            rocdl.s_waitcnt(val)
 
         def wait_lgkmcnt0():
-            _llvm.inline_asm(None, [], "s_waitcnt lgkmcnt(0)", "", has_side_effects=True)
+            rocdl.s_waitcnt(_LGKMCNT_0_ONLY)
 
         # ---- lazy-threshold rescale (reference lane_below + __all vote) ----
         # Returns (corr_vec16, corr_scalar, kept_max). corr == 1.0 when every lane is
