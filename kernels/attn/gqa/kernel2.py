@@ -87,6 +87,30 @@ def build_gqa_attn(
         class _V8BF16Shim:
             ir_type = v8bf16_t
 
+        # ---------------- LDS alias scopes ----------------
+        # The four LDS buffers (k0, k1, v0, v1) never overlap, but with a
+        # double-buffered pipeline the backend cannot prove that a DMA writing
+        # buf1 and a ds_read of buf0 are independent, so SIInsertWaitcnts forces
+        # a full `s_waitcnt vmcnt(0)` drain before every ds_read. Tagging each
+        # buffer's accesses with a distinct alias scope (and marking it noalias
+        # against the other three) lets alias analysis break that false
+        # dependency, so the DMA count is excluded from the read's wait.
+        # Mirrors kernels/flash_attn_gfx950.py:_lds_scope / _lds_alias_scopes.
+        _LDS_ALIAS_DOMAIN = '#llvm.alias_scope_domain<id = "flydsl.gqa.lds">'
+        _lds_scope_names = ("lds_k0", "lds_k1", "lds_v0", "lds_v1")
+
+        def _lds_scope_array(names):
+            attrs = [
+                f'#llvm.alias_scope<id = "{n}", domain = {_LDS_ALIAS_DOMAIN}>' for n in names
+            ]
+            return ir.Attribute.parse(f"[{', '.join(attrs)}]")
+
+        def _lds_alias(name):
+            return _lds_scope_array([name])
+
+        def _lds_noalias(name):
+            return _lds_scope_array([n for n in _lds_scope_names if n != name])
+
         def fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=fm)
 
@@ -101,6 +125,20 @@ def build_gqa_attn(
 
         def bcast16(scalar):
             return Vec.from_elements([fx.Float32(scalar)], f32).broadcast_to(16).ir_value()
+
+        # Hardware exp2 (v_exp_f32) via the ROCDL intrinsic. The generic
+        # math.exp2 lowering expands into a denormal-safe sequence
+        # (v_cmp_gt + v_cndmask + v_exp_f32 + v_ldexp) that bloats the softmax
+        # critical path. Inputs here are already max-subtracted (<= 0) so the
+        # guard is dead weight; this matches hip_kernel.cpp's
+        # __builtin_amdgcn_exp2f, trading a small precision loss for speed.
+        def hw_exp2_scalar(x):
+            return rocdl.exp2(f32.ir_type, _raw(x))
+
+        def hw_exp2_v16(v16):
+            src = Vec(v16)
+            outs = [hw_exp2_scalar(src[k]) for k in range_constexpr(16)]
+            return Vec.from_elements(outs, f32).ir_value()
 
         def mfma(a_v8, b_v8, c_v16):
             return rocdl.mfma_f32_32x32x16_bf16(
@@ -144,7 +182,7 @@ def build_gqa_attn(
         # ---------------- group_load: global -> LDS ----------------
         # lds_base is a wave-uniform SGPR value (readfirstlane-hoisted), matching
         # k_lds_base_* / v_lds_base_* in hip_kernel.cpp.
-        def group_load(lds_base, tile, offsets, rsrc, base_elems, row_stride):
+        def group_load(lds_base, tile, offsets, rsrc, base_elems, row_stride, scope):
             soff_bytes = (base_elems + tile * (KV_BLOCK_SIZE * row_stride)) * 2
             soff_bytes = i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(i32(soff_bytes)))))
             for i in range_constexpr(2):
@@ -154,18 +192,27 @@ def build_gqa_attn(
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc, lds_ptr, i32(BYTES_PER_THREAD),
                     _raw(offsets[i]), _raw(soff_bytes), i32(0), i32(0),
+                    alias_scopes=_lds_alias(scope), noalias_scopes=_lds_noalias(scope),
                 )
 
         def load_k(tile, buf):
-            group_load(k_lds_base[buf], tile, off_K, k_rsrc[buf], k_base_elems, K_stride1)
+            group_load(k_lds_base[buf], tile, off_K, k_rsrc[buf], k_base_elems, K_stride1,
+                       _lds_scope_names[buf])  # lds_k0 / lds_k1
 
         def load_v(tile, buf):
-            group_load(v_lds_base[buf], tile, off_V, v_rsrc[buf], v_base_elems, V_stride1)
+            group_load(v_lds_base[buf], tile, off_V, v_rsrc[buf], v_base_elems, V_stride1,
+                       _lds_scope_names[2 + buf])  # lds_v0 / lds_v1
 
         # ---------------- LDS -> registers ----------------
-        def _read_v8bf16(smem_ptr, byte_off):
-            base = fx.recast_iter(fx.Uint8, smem_ptr)
-            return fx.ptr_load(base + byte_off, result_type=_V8BF16Shim)
+        def _read_v8bf16(smem_ptr, byte_off, scope):
+            # llvm.LoadOp (not fx.ptr_load) so we can attach alias-scope metadata;
+            # scope tags this read as aliasing only its own K buffer.
+            base_i = i32(fx.ptrtoint(smem_ptr)) + i32(byte_off)
+            ptr = buffer_ops.create_llvm_ptr(base_i, address_space=3)
+            return _llvm.LoadOp(
+                v8bf16_t, ptr, alignment=16,
+                alias_scopes=_lds_alias(scope), noalias_scopes=_lds_noalias(scope),
+            ).result
 
         def swizzle_k_expr(row, col):
             offset = (row * 32 + col) * 2
@@ -175,6 +222,7 @@ def build_gqa_attn(
 
         def load_k_regs(buf):
             smem_ptr = k_smem[buf]
+            scope = _lds_scope_names[buf]  # lds_k0 / lds_k1
             row_offset = lid % 32
             col_offset = 8 * (lid // 32)
             ST_BYTES = 32 * 32 * 2
@@ -185,11 +233,14 @@ def build_gqa_attn(
                     for j in range_constexpr(2):
                         col = j * 16 + col_offset
                         byte_off = swizzle_k_expr(row_offset, col) + off_imm
-                        kreg[ii][jj * 2 + j] = _read_v8bf16(smem_ptr, byte_off)
+                        kreg[ii][jj * 2 + j] = _read_v8bf16(smem_ptr, byte_off, scope)
             return kreg  # [n=2][k=8] v8bf16
 
         def load_v_regs(buf):
             smem_ptr = v_smem[buf]
+            scope = _lds_scope_names[2 + buf]  # lds_v0 / lds_v1
+            alias = _lds_alias(scope)
+            noalias = _lds_noalias(scope)
             row_offset = ((lid % 16) // 4) + ((lid // 32) * 4)
             col_offset = ((lid % 4) * 4) + (16 * ((lid % 32) // 16))
             col_in_sub = col_offset % 32
@@ -207,7 +258,8 @@ def build_gqa_attn(
                         off = (shared_row * ST_PER_ROW + shared_col) * ST_BYTES + k * ST_PER_ROW * ST_BYTES
                         addr = base_i + i32(off) + sw
                         ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
-                        halves.append(Vec(rocdl.ds_read_tr16_b64(v4bf16_t, ptr).result))
+                        halves.append(Vec(rocdl.ds_read_tr16_b64(
+                            v4bf16_t, ptr, alias_scopes=alias, noalias_scopes=noalias).result))
                     vreg[i][j] = halves[0].shuffle(halves[1], list(range(8))).ir_value()
             return vreg  # [i=4][j=4] v8bf16
 
@@ -347,7 +399,7 @@ def build_gqa_attn(
             out = []
             for n in range_constexpr(2):
                 d = arith.subf(_raw(att[n]), _raw(b), fastmath=fm)
-                out.append(Vec(d).exp2().ir_value())
+                out.append(hw_exp2_v16(d))
             return out
 
         def to_bf16_packs(att):
@@ -372,7 +424,7 @@ def build_gqa_attn(
             return [arith.subf(_raw(att[n]), _raw(b), fastmath=fm) for n in range_constexpr(2)]
 
         def exp2_one(v16):
-            return Vec(v16).exp2().ir_value()
+            return hw_exp2_v16(v16)
 
         # ---- scheduling helpers (mirror reference sched_barrier templates) ----
         def sb0():
@@ -429,8 +481,8 @@ def build_gqa_attn(
             all_ok = arith.cmpi(arith.CmpIPredicate.eq, _raw(mask), _raw(fx.Int64(0)))
             kept_max = arith.select(all_ok, _raw(max_prev), _raw(m_new))
             scale = arith.subf(_raw(max_prev), _raw(m_new), fastmath=fm)
-            scale_exp = Vec(bcast16(scale)).exp2().ir_value()
-            corr_s = arith.select(all_ok, _raw(f32(1.0)), _raw(Vec(scale_exp)[0]))
+            scale_exp = hw_exp2_scalar(scale)
+            corr_s = arith.select(all_ok, _raw(f32(1.0)), _raw(scale_exp))
             corr_v = bcast16(corr_s)
             return corr_v, fx.Float32(corr_s), fx.Float32(kept_max)
 
@@ -698,10 +750,9 @@ def build_gqa_attn(
             )
             mask = rocdl.ballot(T.i64, not_ok)
             pending = arith.cmpi(arith.CmpIPredicate.ne, _raw(mask), _raw(fx.Int64(0)))
-            scale_exp = Vec(
-                bcast16(arith.subf(_raw(max_prev), _raw(m_new), fastmath=fm))
-            ).exp2().ir_value()
-            scale_s = Vec(scale_exp)[0]
+            scale_s = fx.Float32(
+                hw_exp2_scalar(arith.subf(_raw(max_prev), _raw(m_new), fastmath=fm))
+            )
             # o-multiply factor: scale on rescale, else 1.0 (o unchanged).
             corr_v = bcast16(arith.select(pending, _raw(scale_s), _raw(f32(1.0))))
             # scale_vec is only updated on rescale; otherwise carried forward, so
@@ -901,10 +952,8 @@ def build_gqa_attn(
         #   (after the sched barriers), so callers apply mul_o explicitly.
         def rescale_uncond(att_buf, max_prev):
             m_new = fmaxf(col_max(att_buf), max_prev)
-            scale_s = Vec(
-                bcast16(arith.subf(_raw(max_prev), _raw(m_new), fastmath=fm))
-            ).exp2().ir_value()
-            return fx.Float32(Vec(scale_s)[0]), fx.Float32(m_new)
+            scale_s = hw_exp2_scalar(arith.subf(_raw(max_prev), _raw(m_new), fastmath=fm))
+            return fx.Float32(scale_s), fx.Float32(m_new)
 
         nt = NUM_KV_TILES
 
