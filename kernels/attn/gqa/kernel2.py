@@ -142,10 +142,11 @@ def build_gqa_attn(
             return offs
 
         # ---------------- group_load: global -> LDS ----------------
-        def group_load(smem_ptr, tile, offsets, rsrc, base_elems, row_stride):
+        # lds_base is a wave-uniform SGPR value (readfirstlane-hoisted), matching
+        # k_lds_base_* / v_lds_base_* in hip_kernel.cpp.
+        def group_load(lds_base, tile, offsets, rsrc, base_elems, row_stride):
             soff_bytes = (base_elems + tile * (KV_BLOCK_SIZE * row_stride)) * 2
             soff_bytes = i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(i32(soff_bytes)))))
-            lds_base = i32(fx.ptrtoint(smem_ptr)) + i32(wid * BYTES_PER_WARP)
             for i in range_constexpr(2):
                 lds_ptr = buffer_ops.create_llvm_ptr(
                     lds_base + i32(i * BYTES_PER_MEMCPY), address_space=3
@@ -156,10 +157,10 @@ def build_gqa_attn(
                 )
 
         def load_k(tile, buf):
-            group_load(k_smem[buf], tile, off_K, k_rsrc[buf], k_base_elems, K_stride1)
+            group_load(k_lds_base[buf], tile, off_K, k_rsrc[buf], k_base_elems, K_stride1)
 
         def load_v(tile, buf):
-            group_load(v_smem[buf], tile, off_V, v_rsrc[buf], v_base_elems, V_stride1)
+            group_load(v_lds_base[buf], tile, off_V, v_rsrc[buf], v_base_elems, V_stride1)
 
         # ---------------- LDS -> registers ----------------
         def _read_v8bf16(smem_ptr, byte_off):
@@ -246,10 +247,11 @@ def build_gqa_attn(
                     col = 32 * j + col_offset + k * 8
                     elem0 = k * 4  # (idx=k*2 float2) -> 4 f32 per k
                     elems = [ov[elem0 + e] for e in range_constexpr(4)]
+                    # Vectorized store: 4 bf16 as one buffer_store_b64 (mirrors HIP
+                    # store_o_global's buffer_store_b64), instead of 4 scalar shorts.
                     vbf = Vec.from_elements(elems, f32).to(bf16)
-                    for e in range_constexpr(4):
-                        off = base + row_offset * O_stride1 + col + e
-                        buffer_ops.buffer_store(vbf[e], O_rsrc, _raw(i32(off)))
+                    off = base + row_offset * O_stride1 + col
+                    buffer_ops.buffer_store(vbf.ir_value(), O_rsrc, _raw(i32(off)))
 
         def store_lse(lse_val):
             row_offset = lid % 32
@@ -274,11 +276,43 @@ def build_gqa_attn(
                 att.append(acc)
             return att  # [2] v16f32
 
+        # mma_AtB_QK (mirrors hip_kernel.cpp:177):
+        #   D[n] = C[n] + sum_{k=0..7} A[k][n] * B[k][0]
+        #   A = k_reg_t [8][2] v8bf16, B = q_reg_t [8][1] v8bf16, C = [2] v16f32.
+        def mma_AtB_QK(A, B, C):
+            D = [None, None]
+            for n in range_constexpr(2):
+                acc = mfma(A[0][n], B[0][0], C[n])
+                for k in range_constexpr(1, 8):
+                    acc = mfma(A[k][n], B[k][0], acc)
+                D[n] = acc
+            return D  # [2] v16f32
+
         # OV: o_reg[n=4] += sum_{kk=0..3} v_reg[kk][n] * att_bf[kk]
         def ov_slice(o_reg, vreg_k, att_bf_k):
             for n in range_constexpr(4):
                 o_reg[n] = mfma(vreg_k[n], att_bf_k, o_reg[n])
             return o_reg
+
+        # mma_AtB_OV_slice (mirrors hip_kernel.cpp:216): one OV contraction slice.
+        #   D[n] += A[n] * B  for n in 0..3
+        #   A = v_reg[k] ([4] v8bf16), B = att_block_bf16[k] (v8bf16).
+        def mma_AtB_OV_slice(D, A, B):
+            for n in range_constexpr(4):
+                D[n] = mfma(A[n], B, D[n])
+            return D
+
+        # mma_AtB_OV (mirrors hip_kernel.cpp:198): full OV multiply.
+        #   D[n] = C[n] + sum_{k=0..3} A[k][n] * B[k]
+        #   A = v_reg [4][4] v8bf16, B = att_block_bf16 [4] v8bf16, C = o_reg [4] v16f32.
+        def mma_AtB_OV(C, A, B):
+            D = [None] * 4
+            for n in range_constexpr(4):
+                acc = mfma(A[0][n], B[0], C[n])
+                for k in range_constexpr(1, 4):
+                    acc = mfma(A[k][n], B[k], acc)
+                D[n] = acc
+            return D  # [4] v16f32
 
         # ---------------- softmax helpers on att (v16f32) ----------------
         def col_max(att):
@@ -286,6 +320,21 @@ def build_gqa_attn(
             mx = fmaxf(mx, Vec(att[1]).reduce(fx.ReductionOp.MAX))
             peer = fx.Float32(mx).shuffle_xor(i32(32), i32(64))
             return fmaxf(mx, peer)
+
+        # lane_below (hip_kernel.cpp:286): per-lane (cur - prev) <= T -> i1.
+        def lane_below(prev, cur, thr):
+            delta = arith.subf(_raw(cur), _raw(prev), fastmath=fm)
+            return arith.cmpf(arith.CmpFPredicate.OLE, _raw(delta), _raw(f32(thr)))
+
+        # wave_all_ok (hip_kernel.cpp:290): __all(lane_ok) -> i1, true iff every
+        # active lane is below threshold. __all(x) == (ballot(!x) == 0).
+        _i1_t = ir.IntegerType.get_signless(1)
+
+        def wave_all_ok(lane_ok):
+            true_c = arith.ConstantOp(_i1_t, ir.IntegerAttr.get(_i1_t, 1)).result
+            not_ok = arith.XOrIOp(_raw(lane_ok), true_c).result
+            mask = rocdl.ballot(T.i64, not_ok)
+            return arith.cmpi(arith.CmpIPredicate.eq, _raw(mask), _raw(fx.Int64(0)))
 
         def col_sum(att):
             sm = Vec(att[0]).reduce(fx.ReductionOp.ADD, fastmath=fm)
@@ -419,6 +468,19 @@ def build_gqa_attn(
         tile_idx = i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(block_tile_idx * NUM_WARPS + wid))))
         stagger = wid // 4
 
+        # Per-warp LDS destination bases, hoisted into SGPRs (wave-uniform), matching
+        # k_lds_base_* / v_lds_base_* in hip_kernel.cpp:
+        #   readfirstlane((uint32_t)smem + warpid() * BYTES_PER_WARP)
+        lds_warp_off = i32(wid * BYTES_PER_WARP)
+
+        def _lds_base(smem_ptr):
+            #base = i32(fx.ptrtoint(smem_ptr)) + lds_warp_off
+            return i32(arith.unwrap(rocdl.readfirstlane(T.i32, _raw(i32(fx.ptrtoint(smem_ptr)) + lds_warp_off))))
+
+        k_lds_base = [_lds_base(k_smem_0), _lds_base(k_smem_1)]
+        v_lds_base = [_lds_base(v_smem_0), _lds_base(v_smem_1)]
+
+
         k_base_elems = batch_idx * (ATTN_N * ATTN_H_KV * ATTN_D) + head_idx_kv * ATTN_D
         v_base_elems = batch_idx * (ATTN_N * ATTN_H_KV * ATTN_D) + head_idx_kv * ATTN_D
 
@@ -545,11 +607,7 @@ def build_gqa_attn(
                 k_reg_t[j][i] = k_reg[i][j]
 
         # mma_AtB_QK: att_block[0][n] = sum_k k_reg_t[k][n] * q_reg_t[k][0]
-        for n in range_constexpr(2):
-            acc = att_block[0][n]
-            for k in range_constexpr(8):
-                acc = mfma(k_reg_t[k][n], q_reg_t[k][0], acc)
-            att_block[0][n] = acc
+        att_block[0] = mma_AtB_QK(k_reg_t, q_reg_t, att_block[0])
 
         # ---------------- Partial softmax for QK[0] ----------------
         # Mirrors hip_kernel.cpp:
@@ -562,18 +620,12 @@ def build_gqa_attn(
         max_vec_prev = max_vec
         att_block[0] = sub_col(att_block[0], max_vec)
         att_block[0][0] = exp2_one(att_block[0][0])
+
         rocdl.sched_barrier(0)
 
-        stagger_cond = arith.cmpi(
-            arith.CmpIPredicate.ne, _raw(i32(stagger)), _raw(i32(0))
-        )
-        if_op = _scf.IfOp(stagger_cond, [], has_else=False, loc=ir.Location.unknown())
-        if len(if_op.regions[0].blocks) == 0:
-            if_op.regions[0].blocks.append(*[])
-        with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+        if stagger > 0:
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
-            _scf.YieldOp([])
 
         rocdl.sched_barrier(0)
 
@@ -644,25 +696,30 @@ def build_gqa_attn(
 
         # ========================================================================
         # Hot loop (mirrors hip_kernel.cpp clusters 0-7, j = 3,5,...,num_tiles-2).
-        # Fully unrolled in Python; py vars rebound to SSA values each iteration.
+        # Body factored into hot_iter (pure: takes carried state, returns new state,
+        # mutates no outer vars) so it can be driven by a rolled runtime loop. A
+        # rolled loop keeps o_reg/k_reg as loop-carried phis (fixed registers across
+        # the back-edge) instead of one giant unrolled live range that spills.
         # Buffer parities: odd tiles use buf1 for K-shared/V-store, even use buf0.
         # ========================================================================
-        for j in range_constexpr(3, NUM_KV_TILES - 1, 2):
+        def hot_iter(j, k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale):
+            jm1 = j - 1
+            jp1 = j + 1
+            k_reg_t = [[None] * 2 for _ in range_constexpr(8)]
+
             # ---- Cluster 0: QK[odd] + finish softmax for QK[even] ----
-            att_block[1] = [ZERO16, ZERO16]
+            att1 = [ZERO16, ZERO16]
             for i in range_constexpr(2):
                 for jj in range_constexpr(8):
                     k_reg_t[jj][i] = k_reg[i][jj]
+
             norm_vec = apply_pending_norm(norm_vec, pending_scale, scale_vec)
-            for n in range_constexpr(2):
-                acc = att_block[1][n]
-                for k in range_constexpr(8):
-                    acc = mfma(k_reg_t[k][n], q_reg_t[k][0], acc)
-                att_block[1][n] = acc
-            even_lo = copy_half(att_block[0][0])          # even height0 -> packs 0,1
-            att_block[0][1] = exp2_one(att_block[0][1])   # finish even height1
-            norm_vec = col_sum_into(att_block[0], norm_vec)
-            even_hi = copy_half(att_block[0][1])          # even height1 -> packs 2,3
+
+            att1 = mma_AtB_QK(k_reg_t, q_reg_t, att1)
+            even_lo = copy_half(att0[0])                  # even height0 -> packs 0,1
+            att0[1] = exp2_one(att0[1])                   # finish even height1
+            norm_vec = col_sum_into(att0, norm_vec)
+            even_hi = copy_half(att0[1])                  # even height1 -> packs 2,3
             att_block_bf16 = [even_lo[0], even_lo[1], even_hi[0], even_hi[1]]
             sched_exp_pairs(6, 3, 1)
             sched_pairs(10, 5, 1)
@@ -681,16 +738,17 @@ def build_gqa_attn(
 
             # ---- Cluster 2: A[even]*V, partial softmax for QK[odd] ----
             rocdl.s_setprio(1)
-            o_reg = ov_slice(o_reg, [v_reg[0][n] for n in range_constexpr(4)], att_block_bf16[0])
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[0], att_block_bf16[0])
             o_reg, scale_vec, pending_scale, max_vec = rescale_defer(
-                att_block[1], o_reg, max_vec_prev, scale_vec)
+                att1, o_reg, max_vec_prev, scale_vec)
             max_vec_prev = max_vec
             sched_pairs(4, 5, 2)
-            o_reg = ov_slice(o_reg, [v_reg[1][n] for n in range_constexpr(4)], att_block_bf16[1])
-            o_reg = ov_slice(o_reg, [v_reg[2][n] for n in range_constexpr(4)], att_block_bf16[2])
-            o_reg = ov_slice(o_reg, [v_reg[3][n] for n in range_constexpr(4)], att_block_bf16[3])
-            att_block[1] = sub_col(att_block[1], max_vec)
-            att_block[1][0] = exp2_one(att_block[1][0])
+
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[1], att_block_bf16[1])
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[2], att_block_bf16[2])
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[3], att_block_bf16[3])
+            att1 = sub_col(att1, max_vec)
+            att1[0] = exp2_one(att1[0])
             sched_pairs(6, 5, 2)
             sched_exp_pairs(6, 3, 2)
             rocdl.s_setprio(0)
@@ -699,7 +757,7 @@ def build_gqa_attn(
             rocdl.sched_barrier(0)
 
             # ---- Cluster 3: Load V[j-1] into shared (buf0), load K from shared (buf0) ----
-            load_v(j - 1, 0)
+            load_v(jm1, 0)
             k_reg = load_k_regs(0)
             wait_lgkmcnt0()
             wait_vmcnt(4)
@@ -708,19 +766,17 @@ def build_gqa_attn(
             rocdl.sched_barrier(0)
 
             # ---- Cluster 4: QK[even] + finish softmax for QK[odd] ----
-            att_block[0] = [ZERO16, ZERO16]
+            att0 = [ZERO16, ZERO16]
             for i in range_constexpr(2):
                 for jj in range_constexpr(8):
                     k_reg_t[jj][i] = k_reg[i][jj]
+
             norm_vec = apply_pending_norm(norm_vec, pending_scale, scale_vec)
-            for n in range_constexpr(2):
-                acc = att_block[0][n]
-                for k in range_constexpr(8):
-                    acc = mfma(k_reg_t[k][n], q_reg_t[k][0], acc)
-                att_block[0][n] = acc
-            att_block[1][1] = exp2_one(att_block[1][1])   # finish odd height1
-            norm_vec = col_sum_into(att_block[1], norm_vec)
-            att_block_bf16 = to_bf16_packs(att_block[1])  # full copy of odd
+
+            att0 = mma_AtB_QK(k_reg_t, q_reg_t, att0)
+            att1[1] = exp2_one(att1[1])                   # finish odd height1
+            norm_vec = col_sum_into(att1, norm_vec)
+            att_block_bf16 = to_bf16_packs(att1)          # full copy of odd
             sched_exp_pairs(6, 3, 3)
             sched_pairs(10, 5, 3)
             rocdl.sched_barrier(0)
@@ -728,7 +784,7 @@ def build_gqa_attn(
             rocdl.sched_barrier(0)
 
             # ---- Cluster 5: Load K[j+1] into shared (buf0), load V from shared (buf1) ----
-            load_k(j + 1, 0)
+            load_k(jp1, 0)
             v_reg = load_v_regs(1)
             wait_lgkmcnt0()
             wait_vmcnt(4)
@@ -738,16 +794,15 @@ def build_gqa_attn(
 
             # ---- Cluster 6: A[odd]*V, partial softmax for QK[even] ----
             rocdl.s_setprio(1)
-            o_reg = ov_slice(o_reg, [v_reg[0][n] for n in range_constexpr(4)], att_block_bf16[0])
-            o_reg, scale_vec, pending_scale, max_vec = rescale_defer(
-                att_block[0], o_reg, max_vec_prev, scale_vec)
+            mma_AtB_OV_slice(o_reg, v_reg[0], att_block_bf16[0])
+            o_reg, scale_vec, pending_scale, max_vec = rescale_defer(att0, o_reg, max_vec_prev, scale_vec)
             max_vec_prev = max_vec
             sched_pairs(4, 5, 4)
-            o_reg = ov_slice(o_reg, [v_reg[1][n] for n in range_constexpr(4)], att_block_bf16[1])
-            o_reg = ov_slice(o_reg, [v_reg[2][n] for n in range_constexpr(4)], att_block_bf16[2])
-            o_reg = ov_slice(o_reg, [v_reg[3][n] for n in range_constexpr(4)], att_block_bf16[3])
-            att_block[0] = sub_col(att_block[0], max_vec)
-            att_block[0][0] = exp2_one(att_block[0][0])
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[1], att_block_bf16[1])
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[2], att_block_bf16[2])
+            o_reg = mma_AtB_OV_slice(o_reg, v_reg[3], att_block_bf16[3])
+            att0 = sub_col(att0, max_vec)
+            att0[0] = exp2_one(att0[0])
             sched_pairs(6, 5, 4)
             sched_exp_pairs(6, 3, 4)
             rocdl.s_setprio(0)
@@ -763,6 +818,52 @@ def build_gqa_attn(
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
+
+            return k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale
+
+        # Flatten/unflatten the carried state to/from a flat list of raw ir.Values,
+        # as required by the runtime range(..., init=) loop-carried phi mechanism.
+        #   layout: k_reg[2][8] (16) | att0[2] (2) | o_reg[4] (4) | max_vec_prev,
+        #           norm_vec, scale_vec (3 f32) | pending_scale (1 i1)  = 26 values
+        def _flatten(k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale):
+            flat = []
+            for i in range_constexpr(2):
+                for jj in range_constexpr(8):
+                    flat.append(_raw(k_reg[i][jj]))
+            flat.append(_raw(att0[0])); flat.append(_raw(att0[1]))
+            for n in range_constexpr(4):
+                flat.append(_raw(o_reg[n]))
+            flat.append(_raw(max_vec_prev)); flat.append(_raw(norm_vec))
+            flat.append(_raw(scale_vec)); flat.append(_raw(pending_scale))
+            return flat
+
+        def _unflatten(flat):
+            p = 0
+            k_reg = [[None] * 8 for _ in range_constexpr(2)]
+            for i in range_constexpr(2):
+                for jj in range_constexpr(8):
+                    k_reg[i][jj] = flat[p]; p += 1
+            att0 = [flat[p], flat[p + 1]]; p += 2
+            o_reg = [flat[p + n] for n in range_constexpr(4)]; p += 4
+            max_vec_prev = fx.Float32(flat[p]); p += 1
+            norm_vec = fx.Float32(flat[p]); p += 1
+            scale_vec = fx.Float32(flat[p]); p += 1
+            pending_scale = flat[p]; p += 1
+            return k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale
+
+        init_flat = _flatten(k_reg, att_block[0], o_reg, max_vec_prev,
+                             norm_vec, scale_vec, pending_scale)
+        _lo = fx.Index(3)
+        _hi = fx.Index(NUM_KV_TILES - 1)
+        _step = fx.Index(2)
+        loop_results = init_flat
+        for j, carried in range(_lo, _hi, _step, init=init_flat):
+            j_i32 = i32(j)
+            st = _unflatten(carried)
+            st = hot_iter(j_i32, *st)
+            loop_results = yield _flatten(*st)
+        (k_reg, att_block[0], o_reg, max_vec_prev, norm_vec, scale_vec,
+         pending_scale) = _unflatten(loop_results)
 
         # ====================================================================
         # Epilogue (mirrors hip_kernel.cpp clusters 0-12). Unconditional rescale
@@ -792,11 +893,7 @@ def build_gqa_attn(
         for i in range_constexpr(2):
             for jj in range_constexpr(8):
                 k_reg_t[jj][i] = k_reg[i][jj]
-        for n in range_constexpr(2):
-            acc = att_block[1][n]
-            for k in range_constexpr(8):
-                acc = mfma(k_reg_t[k][n], q_reg_t[k][0], acc)
-            att_block[1][n] = acc
+        att_block[1] = mma_AtB_QK(k_reg_t, q_reg_t, att_block[1])
         att_block[0][1] = exp2_one(att_block[0][1])
         norm_vec = fmul(norm_vec, scale_vec)
         norm_vec = col_sum_into(att_block[0], norm_vec)
@@ -846,11 +943,7 @@ def build_gqa_attn(
         for i in range_constexpr(2):
             for jj in range_constexpr(8):
                 k_reg_t[jj][i] = k_reg[i][jj]
-        for n in range_constexpr(2):
-            acc = att_block[0][n]
-            for k in range_constexpr(8):
-                acc = mfma(k_reg_t[k][n], q_reg_t[k][0], acc)
-            att_block[0][n] = acc
+        att_block[0] = mma_AtB_QK(k_reg_t, q_reg_t, att_block[0])
         att_block[1][1] = exp2_one(att_block[1][1])
         norm_vec = fmul(norm_vec, scale_vec)
         norm_vec = col_sum_into(att_block[1], norm_vec)
@@ -898,11 +991,7 @@ def build_gqa_attn(
         for i in range_constexpr(2):
             for jj in range_constexpr(8):
                 k_reg_t[jj][i] = k_reg[i][jj]
-        for n in range_constexpr(2):
-            acc = att_block[1][n]
-            for k in range_constexpr(8):
-                acc = mfma(k_reg_t[k][n], q_reg_t[k][0], acc)
-            att_block[1][n] = acc
+        att_block[1] = mma_AtB_QK(k_reg_t, q_reg_t, att_block[1])
         att_block[0][1] = exp2_one(att_block[0][1])
         norm_vec = fmul(norm_vec, scale_vec)
         norm_vec = col_sum_into(att_block[0], norm_vec)
@@ -922,7 +1011,7 @@ def build_gqa_attn(
         rocdl.sched_barrier(0)
 
         # ---- Cluster 10: A*V, full softmax for the last QK (att_block[1]) ----
-        o_reg = full_ov(o_reg, v_reg, att_block_bf16)
+        o_reg = mma_AtB_OV(o_reg, v_reg, att_block_bf16)
         scale_vec, max_vec = rescale_uncond(att_block[1], max_vec_prev)
         max_vec_prev = max_vec
         att_block[1] = sub_col(att_block[1], max_vec)
@@ -947,8 +1036,11 @@ def build_gqa_attn(
         rocdl.sched_barrier(0)
 
         # ---- Cluster 12: Final A*V and normalize ----
-        o_reg = full_ov(o_reg, v_reg, att_block_bf16)
-        inv = arith.divf(_raw(f32(1.0)), _raw(norm_vec), fastmath=fm)
+        o_reg = mma_AtB_OV(o_reg, v_reg, att_block_bf16)
+        # Single reciprocal + broadcast multiply (mirrors HIP div_col_o). Using an
+        # opaque rocdl.rcp instead of fast-math divf stops the compiler from
+        # re-expanding this into a full IEEE division per O element (64 divisions).
+        inv = rocdl.rcp(T.f32, _raw(norm_vec))
         o_reg = mul_o(o_reg, inv)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()

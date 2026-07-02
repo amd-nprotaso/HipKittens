@@ -4,7 +4,7 @@ import flydsl.expr as fx
 from kernel2 import build_gqa_attn
 
 torch.manual_seed(0)
-B, D, H, H_KV, N = 1, 128, 8, 2, 256
+B, D, H, H_KV, N = 16, 128, 64, 8, 4096
 dtype = torch.bfloat16
 
 q = torch.randn(B, N, H, D, dtype=dtype, device="cuda")
@@ -29,22 +29,3 @@ print("compiled OK")
 compiled(*args(q, k, v, out, lse))
 torch.cuda.synchronize()
 print("ran OK")
-
-G = H // H_KV
-qh = q.transpose(1, 2).float()
-kh = k.transpose(1, 2).repeat_interleave(G, dim=1).float()
-vh = v.transpose(1, 2).repeat_interleave(G, dim=1).float()
-ref = torch.nn.functional.scaled_dot_product_attention(qh, kh, vh).transpose(1, 2).to(dtype)
-
-diff = (out.float() - ref.float()).abs()
-cos = torch.nn.functional.cosine_similarity(out.flatten().float(), ref.flatten().float(), dim=0).item()
-print(f"max_abs={diff.max().item():.5f} mean_abs={diff.mean().item():.5f} cos={cos:.6f}")
-print("TK :", out[0, 0, :8, 0])
-print("ref:", ref[0, 0, :8, 0])
-
-scale = 1.0 / (D ** 0.5)
-scores = (qh @ kh.transpose(-1, -2)) * scale
-lse_ref = torch.logsumexp(scores, dim=-1)
-lse_fly = lse[:, :, 0, :]
-ldiff = (lse_fly - lse_ref).abs()
-print(f"LSE max_abs={ldiff.max().item():.5f} mean={ldiff.mean().item():.6f}")
